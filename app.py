@@ -1,14 +1,13 @@
 """International cost of capital | Streamlit teaching application.
 
 Run: streamlit run app.py
-Market inputs require internet access. Trading Economics API is optional;
-otherwise government yields are entered manually, with explicit provenance.
+Market inputs require internet access. Trading Economics public-page extraction
+is best-effort, with an explicit manual fallback; no API key is used.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import BytesIO
-import os
 import re
 
 import pandas as pd
@@ -20,7 +19,6 @@ BETAS_XLS = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 BETAS_HTML = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/Betas.html"
 TAX_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ctryprem.html"
 SPREAD_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
-TE_URL = "https://api.tradingeconomics.com/markets/bond"
 COUNTRIES = {
     "United States": ("USD", "united-states"),
     "Australia": ("AUD", "australia"), "Brazil": ("BRL", "brazil"),
@@ -145,31 +143,40 @@ def load_bbb_spread() -> float:
     raise ValueError("BBB spread was not found in Damodaran's ratings table")
 
 
-def get_api_key() -> str:
-    try:
-        return st.secrets.get("TRADING_ECONOMICS_API_KEY", os.getenv("TRADING_ECONOMICS_API_KEY", ""))
-    except Exception:
-        return os.getenv("TRADING_ECONOMICS_API_KEY", "")
+def parse_te_public_page(html: str, country: str) -> tuple[float, str]:
+    """Extract an observed 10Y quote from a public country yield page.
+
+    Rejects pages whose header/quote cannot be verified. This is best-effort,
+    NOT an official API or guaranteed to work on Streamlit Cloud.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    # Strip scripts so embedded forecasts and JSON cannot masquerade as a quote.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if "10" not in heading_text or not re.search(r"bond|treasury|yield", heading_text, re.I):
+        raise ValueError(f"10-year bond page heading not found for {country}")
+    text = soup.get_text(" ", strip=True)
+    # 'Actual' is the main current quote; take the FIRST one immediately after the heading.
+    start = text.find(heading_text)
+    relevant = text[start : start + 450] if start >= 0 else ""
+    m = re.search(r"\bActual\s+(-?\d{1,2}(?:\.\d{1,5})?)\b\s+Daily\s+Change\b", relevant, re.I)
+    if not m:
+        raise ValueError("10-year Actual yield quote not found in public HTML")
+    yield_pct = float(m.group(1))
+    if not -20 <= yield_pct <= 40:
+        raise ValueError("Public yield outside conservative validation range")
+    # This is an observation date only if stated explicitly on the page.
+    date_match = re.search(r"(?:last updated on|on)\s+([A-Z][a-z]+\s+\d{1,2},?\s+20\d{2})", text, re.I)
+    observation = date_match.group(1) if date_match else "date not verified (check source)"
+    return yield_pct, observation
 
 
-def load_yields(api_key: str) -> dict[str, tuple[float, str]]:
-    response = requests.get(TE_URL, params={"c": api_key, "type": "10Y"}, timeout=18)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise ValueError("Trading Economics did not return a bond list")
-    result = {}
-    for item in payload:
-        try:
-            name = str(item.get("Country", "")).strip().casefold()
-            value = float(item["Last"])
-            date = str(item.get("LastUpdate") or item.get("Date") or "undated")
-            if "10y" not in str(item.get("Name", "")).lower() and "10" not in str(item.get("Ticker", "")):
-                continue
-            result[name] = (value, date)
-        except (KeyError, ValueError, TypeError):
-            continue
-    return result
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_te_public_yield(slug: str, country: str) -> tuple[float, str]:
+    url = f"https://tradingeconomics.com/{slug}/government-bond-yield"
+    return parse_te_public_page(get_page(url), country)
 
 
 def calculate(beta_u: float, debt_weight: float, tax: float, erp: float,
@@ -213,6 +220,7 @@ st.sidebar.header("Project assumptions")
 refresh = st.sidebar.button("↻ Refresh external data", help="Clears cached Damodaran inputs and reloads the Trading Economics snapshot")
 if refresh:
     get_damodaran.clear()
+    load_te_public_yield.clear()
     st.rerun()
 with st.spinner("Reading published data..."):
     sources, errors = get_damodaran()
@@ -245,34 +253,55 @@ spread_us = st.sidebar.number_input("BBB USD borrowing spread (%)", 0.0, 30.0,
 
 st.subheader("Government bond yields • Trading Economics")
 st.caption("The 10-year government yield is used as a teaching proxy for each currency's base rate. Sovereign credit and inflation components are not separately removed.")
-api_key = get_api_key()
-api_yields, api_error = {}, None
-if api_key:
-    try:
-        api_yields = load_yields(api_key)
-    except Exception as exc:
-        api_error = str(exc)
-if not api_key:
-    st.info("No Trading Economics API key configured. Enter yields from the linked public pages; manual values are never presented as live quotes. Set TRADING_ECONOMICS_API_KEY as an environment variable or Streamlit secret for automated retrieval.")
-elif api_error:
-    st.warning(f"Trading Economics API unavailable ({api_error}). Please enter the displayed yields manually.")
+# No paid API or API-key setup. Read public pages when possible; otherwise enter yields manually.
+use_public = st.checkbox(
+    "Automatically read Trading Economics public pages (best effort)",
+    value=True,
+    help="Public HTML format may change, automated access may be restricted, and website terms apply."
+)
 
-us_record = api_yields.get("united states")
-fc_record = api_yields.get(country.casefold())
+def resolve_yield(country_name: str, country_slug: str):
+    if use_public:
+        try:
+            val, date = load_te_public_yield(country_slug, country_name)
+            return val, date, "Trading Economics public page", None
+        except Exception as e:
+            return None, None, None, str(e)
+    return None, None, None, "Public-page retrieval disabled"
+
+us_value, us_source_date, us_source, us_error = resolve_yield("United States", "united-states")
+if country == "United States":
+    fc_value, fc_source_date, fc_source, fc_error = us_value, us_source_date, us_source, us_error
+else:
+    fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
+
+if us_error or fc_error:
+    st.warning("Automatic government yield retrieval incomplete. Enter and verify missing values manually. "
+               + "; ".join(f"{name}: {err}" for name, err in (("US", us_error), (country, fc_error)) if err))
+
 col1, col2 = st.columns(2)
 with col1:
-    us_manual = st.checkbox("Override U.S. government yield manually", value=us_record is None, key="us_manual")
-    us_default = us_record[0] if us_record else 4.00
+    us_manual = st.checkbox("Override U.S. government yield manually", value=us_value is None,
+                            key="us_manual", disabled=us_value is None)
+    if us_value is None:
+        us_manual = True
     rf_us = st.number_input("U.S. 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                             value=float(us_default), step=0.1, disabled=not us_manual, key="us_yield") if us_manual else float(us_record[0])
-    st.caption(f"Source: {'manual / example input' if us_manual else 'Trading Economics API'}; date: {st.text_input('U.S. observation date (manual)', value='not provided', key='us_date') if us_manual else us_record[1]}")
+                            value=float(us_value if us_value is not None else 4.0), step=0.1,
+                            disabled=not us_manual, key="us_yield") if us_manual else float(us_value)
+    us_date = st.text_input("U.S. observation date (manual)", value="not provided", key="us_date") if us_manual else us_source_date
+    st.caption(f"Source: {'manual / illustrative initial value' if us_manual else us_source}; date: {us_date}")
     st.markdown("[U.S. 10Y source](https://tradingeconomics.com/united-states/government-bond-yield)")
 with col2:
-    fc_manual = st.checkbox("Override selected-country yield manually", value=fc_record is None, key="fc_manual")
-    fc_default = fc_record[0] if fc_record else (float(us_record[0]) if country == "United States" and us_record else (4.00 if country == "United States" else 3.00))
+    fc_manual = st.checkbox("Override selected-country yield manually", value=fc_value is None,
+                            key=f"fc_manual_{country}", disabled=fc_value is None)
+    if fc_value is None:
+        fc_manual = True
+    fc_default = fc_value if fc_value is not None else (rf_us if country == "United States" else 3.0)
     rf_foreign = st.number_input(f"{country} 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                                 value=float(fc_default), step=0.1, disabled=not fc_manual, key=f"fc_yield_{country}") if fc_manual else float(fc_record[0])
-    st.caption(f"Source: {'manual / example input' if fc_manual else 'Trading Economics API'}; date: {st.text_input('Country observation date (manual)', value='not provided', key=f'fc_date_{country}') if fc_manual else fc_record[1]}")
+                                 value=float(fc_default), step=0.1, disabled=not fc_manual,
+                                 key=f"fc_yield_{country}") if fc_manual else float(fc_value)
+    fc_date = st.text_input("Country observation date (manual)", value="not provided", key=f"fc_date_{country}") if fc_manual else fc_source_date
+    st.caption(f"Source: {'manual / illustrative initial value' if fc_manual else fc_source}; date: {fc_date}")
     st.markdown(f"[{country} 10Y source](https://tradingeconomics.com/{slug}/government-bond-yield)")
 
 if country == "United States" and abs(rf_us - rf_foreign) > 1e-8:
@@ -321,7 +350,7 @@ else:
                      f"{currency} cost of debt (%)": z["cost_d_fc"], f"{currency} WACC (%)": z["wacc_fc"]})
     industry_df = pd.DataFrame(rows).sort_values("USD WACC (%)")
     st.caption("Only industry beta varies. Country, risk-free yields, tax rate, ERP, financing weights and spreads are held constant.")
-    st.dataframe(industry_df, use_container_width=True, hide_index=True)
+    st.dataframe(industry_df, width="stretch", hide_index=True)
     st.download_button("Download all-industry results (CSV)", industry_df.to_csv(index=False).encode(),
                        file_name="international_cost_of_capital_industries.csv", mime="text/csv")
 
@@ -332,6 +361,8 @@ selected_row = pd.DataFrame([{
     "country_10y_yield_pct": rf_foreign, "us_bbb_spread_pct": spread_us,
     "fc_bbb_spread_pct": values["spread_fc"], "fc_bbb_spread_override": spread_override_on,
     "us_cost_equity_pct": values["cost_e_us"], "us_cost_debt_pct": values["cost_d_us"],
+    "us_yield_source": "manual" if us_manual else us_source, "us_observation_date": us_date,
+    "fc_yield_source": "manual" if fc_manual else fc_source, "fc_observation_date": fc_date,
     "us_wacc_pct": values["wacc_us"], "fc_cost_equity_pct": values["cost_e_fc"],
     "fc_cost_debt_pct": values["cost_d_fc"], "fc_wacc_pct": values["wacc_fc"],
 }])
@@ -339,7 +370,7 @@ st.download_button("Download current project result (CSV)", selected_row.to_csv(
                    file_name="international_cost_of_capital_project.csv", mime="text/csv")
 
 st.subheader("Data sources and provenance")
-st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — dates shown above when API available; manual input otherwise")
+st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — source and date shown above for API/public HTML; manual input otherwise")
 st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
 if "betas" not in sources or "tax" not in sources or "spread" not in sources or us_manual or fc_manual:
     st.info("At least one figure is manually specified or an example fallback. Confirm source links and observation dates before submitting financial conclusions.")
