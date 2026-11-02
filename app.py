@@ -90,38 +90,72 @@ def load_betas() -> tuple[pd.DataFrame, str]:
 
 
 def parse_country_taxes(html: str) -> dict[str, float]:
-    """Parse Damodaran's country table, including layouts with <td> headers.
+    """Read the country/tax column, tolerating nonstandard Damodaran HTML.
 
-    HTML tables may use td rather than th in the header row, so a naive
-    pd.read_html() often produces numeric column labels instead of names.
+    First match explicit header columns. If the HTML uses unusual headers,
+    parse country rows by their published ordering: country, Moody's rating,
+    adjusted default spread, country risk premium, ERP, corporate tax rate.
+    Fail rather than silently returning an unvalidated column.
     """
     soup = BeautifulSoup(html, "html.parser")
-    for table in soup.find_all("table"):
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = [cell.get_text(" ", strip=True) for cell in tr.find_all(["th", "td"], recursive=False)]
-            if cells:
-                rows.append(cells)
-        for header_idx, headers in enumerate(rows):
-            normalized = [re.sub(r"\s+", " ", value).strip().casefold() for value in headers]
-            country_idx = next((idx for idx, label in enumerate(normalized) if label == "country"), None)
-            tax_idx = next((idx for idx, label in enumerate(normalized) if "corporate tax rate" in label), None)
-            if country_idx is None or tax_idx is None:
+    rows = []
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"], recursive=False)]
+        if cells:
+            rows.append(cells)
+
+    def norm(value):
+        return re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+
+    # First strategy: explicitly identify the table column names.
+    for i, row in enumerate(rows):
+        normalized = [norm(c) for c in row]
+        country_idx = next((j for j, c in enumerate(normalized) if c == "country"), None)
+        tax_idx = next((j for j, c in enumerate(normalized)
+                        if "corporate" in c and "tax" in c and "rate" in c), None)
+        if country_idx is None or tax_idx is None:
+            continue
+        result = {}
+        for candidate in rows[i+1:]:
+            if len(candidate) <= max(country_idx, tax_idx):
                 continue
-            result = {}
-            for row in rows[header_idx + 1:]:
-                if max(country_idx, tax_idx) >= len(row):
-                    continue
-                name = row[country_idx].strip()
-                try:
-                    tax = parse_rate(row[tax_idx])
-                    if name and 0 <= tax <= 100:
-                        result[name] = tax
-                except (ValueError, TypeError):
-                    continue
-            if result:
-                return result
-    raise ValueError("Could not locate a country/corporate-tax-rate table in the HTML")
+            country_name = candidate[country_idx].strip()
+            try:
+                value = parse_rate(candidate[tax_idx])
+            except (TypeError, ValueError):
+                continue
+            if country_name and 0 <= value <= 100:
+                result[country_name] = value
+        if len(result) >= 10:
+            return result
+
+    # Second strategy: rows may render as a single combined text element.
+    # Moody's ratings and the FOUR consecutive percentage columns give a
+    # structural validation: the fourth is the corporate tax rate.
+    rating = r"(?:Aaa|Aa[123]|A[123]|Baa[123]|Ba[123]|B[123]|Caa[123]|Ca|C|NR)"
+    pct = r"(-?\d+(?:\.\d+)?)\s*%"
+    row_re = re.compile(
+        rf"^(.+?)\s+({rating})\s+{pct}\s+{pct}\s+{pct}\s+{pct}(?:\s|$)",
+        re.I,
+    )
+    result = {}
+    for row in rows:
+        joined = " ".join(row)
+        joined = re.sub(r"\s+", " ", joined).strip()
+        match = row_re.match(joined)
+        if match:
+            country_name = match.group(1).strip()
+            value = float(match.group(6))
+            if country_name and 0 <= value <= 100:
+                result[country_name] = value
+    if len(result) >= 10:
+        return result
+
+    sample = [" | ".join(row[:8])[:160] for row in rows[:4]]
+    raise ValueError(
+        f"Tax-rate table was not identified ({len(rows)} HTML rows; "
+        f"{len(result)} rating-pattern matches). First rows: {sample}"
+    )
 
 
 def load_tax() -> dict[str, float]:
@@ -168,8 +202,11 @@ def parse_te_public_page(html: str, country: str) -> tuple[float, str]:
     if not -20 <= yield_pct <= 40:
         raise ValueError("Public yield outside conservative validation range")
     # This is an observation date only if stated explicitly on the page.
-    date_match = re.search(r"(?:last updated on|on)\s+([A-Z][a-z]+\s+\d{1,2},?\s+20\d{2})", text, re.I)
-    observation = date_match.group(1) if date_match else "date not verified (check source)"
+    # Prefer the observation date tied to the 10Y yield quote, rather than a date
+    # from an unrelated news story. If unavailable, leave the date unverified.
+    stats = re.search(r"(?:10.year government bond yield|10Y bond yield)[^.]{0,150}?\bon\s+([A-Z][a-z]+\s+\d{1,2},?\s+20\d{2})", text, re.I)
+    updated = re.search(r"(?:data, forecasts, historical chart\s+-\s+was last updated on)\s+([A-Z][a-z]+\s+\d{1,2}(?:\s+of)?\s+20\d{2})", text, re.I)
+    observation = (stats.group(1) if stats else updated.group(1) if updated else "not verified on source page")
     return yield_pct, observation
 
 
@@ -242,14 +279,37 @@ beta_u = st.sidebar.number_input("Unlevered beta", min_value=0.0, max_value=10.0
 erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 40.0, 6.5, 0.25)
 debt_pct = st.sidebar.slider("Target debt financing (% of D+E)", 0, 95, 30)
 
-published_tax = sources.get("tax", {}).get(country)
-tax = st.sidebar.number_input("Project corporate tax rate (%)", 0.0, 100.0,
-                               float(published_tax) if published_tax is not None else 25.0,
-                               step=0.5, key=f"tax_{country}", help="Manual override of Damodaran country corporate tax rate.")
+published_tax = sources.get("tax", {}).get("Korea" if country == "South Korea" else country)
 published_spread = sources.get("spread")
-spread_us = st.sidebar.number_input("BBB USD borrowing spread (%)", 0.0, 30.0,
-                                    float(published_spread) if published_spread is not None else 1.11,
-                                    step=0.05, help="Default 1.11% is an explicitly labeled example when source is unavailable.")
+
+# Published Damodaran values are used automatically. Overrides only appear
+# when the user explicitly requests one, or when downloading fails.
+st.sidebar.markdown("### Published Damodaran inputs")
+if published_tax is not None:
+    st.sidebar.caption(f"{country} corporate tax rate: **{published_tax:.2f}%** (Damodaran)")
+    tax_override = st.sidebar.checkbox("Override corporate tax rate", value=False, key="override_tax")
+else:
+    st.sidebar.warning(f"No published tax rate available for {country}; enter a value below.")
+    tax_override = True
+if tax_override:
+    tax = st.sidebar.number_input("Project corporate tax rate (%)", 0.0, 100.0,
+                                  value=float(published_tax) if published_tax is not None else 25.0,
+                                  step=0.5, key=f"manual_tax_{country}")
+else:
+    tax = float(published_tax)
+
+if published_spread is not None:
+    st.sidebar.caption(f"BBB USD borrowing spread: **{published_spread:.3f}%** (Damodaran)")
+    spread_override = st.sidebar.checkbox("Override USD BBB spread", value=False, key="override_us_spread")
+else:
+    st.sidebar.warning("Published BBB USD spread unavailable; enter a value below.")
+    spread_override = True
+if spread_override:
+    spread_us = st.sidebar.number_input("BBB USD borrowing spread (%)", 0.0, 30.0,
+                                        value=float(published_spread) if published_spread is not None else 1.11,
+                                        step=0.05, key="manual_us_spread")
+else:
+    spread_us = float(published_spread)
 
 st.subheader("Government bond yields • Trading Economics")
 st.caption("The 10-year government yield is used as a teaching proxy for each currency's base rate. Sovereign credit and inflation components are not separately removed.")
@@ -274,6 +334,17 @@ if country == "United States":
     fc_value, fc_source_date, fc_source, fc_error = us_value, us_source_date, us_source, us_error
 else:
     fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
+
+# Make the fetched data visible even when the user has not enabled an override.
+st.markdown("**Automatically retrieved Trading Economics quotes**")
+quotes = [
+    {"Market": "United States 10Y", "Retrieved yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
+     "Observation date on source": us_source_date if us_value is not None else "Unavailable", "Source": us_source or "Manual required"},
+    {"Market": f"{country} 10Y", "Retrieved yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
+     "Observation date on source": fc_source_date if fc_value is not None else "Unavailable", "Source": fc_source or "Manual required"},
+]
+st.dataframe(pd.DataFrame(quotes), hide_index=True, width="stretch")
+st.caption("These are the retrieved values, not necessarily the values used if manual override is enabled. An unverified observation date is not the retrieval date. Refresh external data to request a new snapshot.")
 
 if us_error or fc_error:
     st.warning("Automatic government yield retrieval incomplete. Enter and verify missing values manually. "
@@ -362,6 +433,8 @@ selected_row = pd.DataFrame([{
     "fc_bbb_spread_pct": values["spread_fc"], "fc_bbb_spread_override": spread_override_on,
     "us_cost_equity_pct": values["cost_e_us"], "us_cost_debt_pct": values["cost_d_us"],
     "us_yield_source": "manual" if us_manual else us_source, "us_observation_date": us_date,
+    "tax_source": "manual override" if tax_override else "Damodaran",
+    "us_bbb_spread_source": "manual override" if spread_override else "Damodaran",
     "fc_yield_source": "manual" if fc_manual else fc_source, "fc_observation_date": fc_date,
     "us_wacc_pct": values["wacc_us"], "fc_cost_equity_pct": values["cost_e_fc"],
     "fc_cost_debt_pct": values["cost_d_fc"], "fc_wacc_pct": values["wacc_fc"],
@@ -372,5 +445,5 @@ st.download_button("Download current project result (CSV)", selected_row.to_csv(
 st.subheader("Data sources and provenance")
 st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — source and date shown above for API/public HTML; manual input otherwise")
 st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
-if "betas" not in sources or "tax" not in sources or "spread" not in sources or us_manual or fc_manual:
+if "betas" not in sources or tax_override or spread_override or us_manual or fc_manual:
     st.info("At least one figure is manually specified or an example fallback. Confirm source links and observation dates before submitting financial conclusions.")
