@@ -91,21 +91,43 @@ def load_betas() -> tuple[pd.DataFrame, str]:
     return beta_from_html(get_page(BETAS_HTML)), BETAS_HTML
 
 
-def load_tax() -> dict[str, float]:
-    for raw in pd.read_html(BytesIO(get_page(TAX_URL).encode("utf-8"))):
-        df = clean_columns(raw)
-        country_col = next((c for c in df if c == "country"), None)
-        tax_col = next((c for c in df if "corporate tax rate" in c), None)
-        if country_col and tax_col:
-            output = {}
-            for _, row in df.iterrows():
+def parse_country_taxes(html: str) -> dict[str, float]:
+    """Parse Damodaran's country table, including layouts with <td> headers.
+
+    HTML tables may use td rather than th in the header row, so a naive
+    pd.read_html() often produces numeric column labels instead of names.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = [cell.get_text(" ", strip=True) for cell in tr.find_all(["th", "td"], recursive=False)]
+            if cells:
+                rows.append(cells)
+        for header_idx, headers in enumerate(rows):
+            normalized = [re.sub(r"\s+", " ", value).strip().casefold() for value in headers]
+            country_idx = next((idx for idx, label in enumerate(normalized) if label == "country"), None)
+            tax_idx = next((idx for idx, label in enumerate(normalized) if "corporate tax rate" in label), None)
+            if country_idx is None or tax_idx is None:
+                continue
+            result = {}
+            for row in rows[header_idx + 1:]:
+                if max(country_idx, tax_idx) >= len(row):
+                    continue
+                name = row[country_idx].strip()
                 try:
-                    output[str(row[country_col]).strip()] = parse_rate(row[tax_col])
+                    tax = parse_rate(row[tax_idx])
+                    if name and 0 <= tax <= 100:
+                        result[name] = tax
                 except (ValueError, TypeError):
-                    pass
-            if output:
-                return output
-    raise ValueError("No corporate tax table located")
+                    continue
+            if result:
+                return result
+    raise ValueError("Could not locate a country/corporate-tax-rate table in the HTML")
+
+
+def load_tax() -> dict[str, float]:
+    return parse_country_taxes(get_page(TAX_URL))
 
 
 def load_bbb_spread() -> float:
