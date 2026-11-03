@@ -1,659 +1,801 @@
-"""International cost of capital | Streamlit teaching application.
-
-Run: streamlit run app.py
-Market inputs require internet access. Trading Economics public-page extraction
-is best-effort, with an explicit manual fallback; no API key is used.
 """
+International Cost of Capital App
+---------------------------------
+Compares a project's cost of equity, cost of debt and WACC in USD and in the
+currency of a selected country.
+
+Data sources
+  * Unlevered industry betas  : Damodaran, betas.xls (U.S.)
+  * Corporate tax rates       : Damodaran, ctryprem.html
+  * USD BBB spread            : Damodaran, ratings.html (Baa2/BBB, large non-financial firms)
+  * 10-year government yields : Trading Economics, /bonds
+
+Model
+  D/E      = wD / (1 - wD)
+  beta_L   = beta_U * [1 + (1 - T) * D/E]
+  kE,c     = r10Y,c + beta_L * ERP
+  sFC_auto = sUSD * (1 + r10Y,FC) / (1 + r10Y,USD)      (rates in decimals)
+  kD,c     = r10Y,c + s_c
+  WACC_c   = (1 - wD) * kE,c + wD * kD,c * (1 - T)
+"""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from io import BytesIO
+import datetime as dt
+import io
 import re
+from email.utils import parsedate_to_datetime
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-BETAS_XLS = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
-BETAS_HTML = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/Betas.html"
-TAX_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ctryprem.html"
-SPREAD_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
-TE_BONDS_URL = "https://tradingeconomics.com/bonds"
-# Country names verified on Trading Economics' public /bonds 10Y table.
-# Do not add countries based solely on a guessed per-country URL.
-COUNTRY_CURRENCIES = {
-    "Australia": "AUD", "Austria": "EUR", "Belgium": "EUR",
-    "Brazil": "BRL", "Canada": "CAD", "Chile": "CLP", "China": "CNY",
-    "Colombia": "COP", "Croatia": "EUR", "Czech Republic": "CZK",
-    "Denmark": "DKK", "Finland": "EUR", "France": "EUR",
-    "Germany": "EUR", "Greece": "EUR", "Hong Kong": "HKD",
-    "Hungary": "HUF", "Iceland": "ISK", "India": "INR",
-    "Indonesia": "IDR", "Ireland": "EUR", "Israel": "ILS",
-    "Italy": "EUR", "Japan": "JPY", "Kenya": "KES",
-    "Lithuania": "EUR", "Malaysia": "MYR", "Mexico": "MXN",
-    "Netherlands": "EUR", "New Zealand": "NZD", "Nigeria": "NGN",
-    "Norway": "NOK", "Pakistan": "PKR", "Peru": "PEN",
-    "Philippines": "PHP", "Poland": "PLN", "Portugal": "EUR",
-    "Romania": "RON", "Russia": "RUB", "Singapore": "SGD",
-    "Slovakia": "EUR", "Slovenia": "EUR", "South Africa": "ZAR",
-    "South Korea": "KRW", "Spain": "EUR", "Sweden": "SEK",
-    "Switzerland": "CHF", "Taiwan": "TWD", "Thailand": "THB",
-    "Turkey": "TRY", "United Kingdom": "GBP", "United States": "USD",
-    "Vietnam": "VND", "Zambia": "ZMW",
-}
-COUNTRY_ALIASES = {
-    "South Korea": ("Korea", "Korea (South)", "Republic of Korea"),
-    "Czech Republic": ("Czechia",),
-    "Russia": ("Russian Federation",),
-    "Turkey": ("Turkiye", "Türkiye"),
-    "Vietnam": ("Viet Nam",),
-    "Taiwan": ("Taiwan (Province of China)",),
-    "Hong Kong": ("Hong Kong SAR", "Hong Kong SAR, China"),
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+st.set_page_config(
+    page_title="International Cost of Capital",
+    page_icon="🌍",
+    layout="wide",
+)
+
+BETA_URLS = [
+    "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls",
+]
+TAX_URLS = [
+    "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ctryprem.html",
+    "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ctryprem.html",
+]
+RATING_URLS = [
+    "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ratings.html",
+    "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html",
+]
+TE_URL = "https://tradingeconomics.com/bonds"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+DEFAULT_INDUSTRY = "Software (System & Application)"
+DEFAULT_COUNTRY = "United States"
+DEFAULT_ERP = 6.5      # %
+DEFAULT_DEBT = 30.0    # %
 
-st.set_page_config(page_title="International Cost of Capital", page_icon="🌐", layout="wide")
-st.title("🌐 International Cost of Capital")
-st.caption("A transparent, currency-consistent cost-of-capital calculator • rates and spreads are annual percentages")
+# Placeholders used ONLY if a live fetch fails. They are flagged in the UI and
+# should be replaced with manual overrides.
+FALLBACK_BETAS = {DEFAULT_INDUSTRY: 1.20}
+FALLBACK_TAX = {"United States": 0.25}
+FALLBACK_SPREAD = 0.0125
+FALLBACK_YIELDS = {"United States": 0.042}
+
+# Country-name harmonisation between Damodaran and Trading Economics
+ALIASES = {
+    "us": "united states", "usa": "united states", "u.s.": "united states",
+    "united states of america": "united states",
+    "uk": "united kingdom", "great britain": "united kingdom",
+    "south korea": "korea", "korea, republic of": "korea", "republic of korea": "korea",
+    "czechia": "czech republic", "turkiye": "turkey", "türkiye": "turkey",
+    "viet nam": "vietnam", "russian federation": "russia",
+    "slovak republic": "slovakia", "hong kong sar": "hong kong",
+    "ivory coast": "cote d'ivoire", "côte d'ivoire": "cote d'ivoire",
+    "macedonia": "north macedonia", "euro area": "euro area",
+}
+
+CURRENCY = {
+    "united states": "USD", "canada": "CAD", "mexico": "MXN", "brazil": "BRL",
+    "chile": "CLP", "colombia": "COP", "peru": "PEN", "argentina": "ARS",
+    "united kingdom": "GBP", "germany": "EUR", "france": "EUR", "italy": "EUR",
+    "spain": "EUR", "netherlands": "EUR", "belgium": "EUR", "austria": "EUR",
+    "portugal": "EUR", "ireland": "EUR", "greece": "EUR", "finland": "EUR",
+    "slovakia": "EUR", "slovenia": "EUR", "croatia": "EUR", "lithuania": "EUR",
+    "latvia": "EUR", "estonia": "EUR", "cyprus": "EUR", "malta": "EUR",
+    "switzerland": "CHF", "sweden": "SEK", "norway": "NOK", "denmark": "DKK",
+    "poland": "PLN", "czech republic": "CZK", "hungary": "HUF", "romania": "RON",
+    "turkey": "TRY", "russia": "RUB", "israel": "ILS", "south africa": "ZAR",
+    "egypt": "EGP", "nigeria": "NGN", "kenya": "KES", "morocco": "MAD",
+    "japan": "JPY", "china": "CNY", "hong kong": "HKD", "taiwan": "TWD",
+    "korea": "KRW", "india": "INR", "indonesia": "IDR", "malaysia": "MYR",
+    "philippines": "PHP", "singapore": "SGD", "thailand": "THB",
+    "vietnam": "VND", "pakistan": "PKR", "bangladesh": "BDT", "sri lanka": "LKR",
+    "australia": "AUD", "new zealand": "NZD", "saudi arabia": "SAR",
+    "qatar": "QAR", "united arab emirates": "AED", "serbia": "RSD",
+    "bulgaria": "BGN", "iceland": "ISK", "ukraine": "UAH",
+}
 
 
-with st.expander("Model equations and assumptions", expanded=True):
-    st.latex(r"\beta_L=\beta_U\left[1+(1-T)\frac{D}{E}\right],\quad \frac{D}{E}=\frac{w_D}{1-w_D}")
-    st.latex(r"k_{E,c}=r_{10Y,c}+\beta_L\,ERP")
-    st.latex(r"s_{FC}^{auto}=s_{USD}\frac{1+r_{10Y,FC}}{1+r_{10Y,USD}}\quad\text{(rates in decimals)}")
-    st.latex(r"k_{D,c}=r_{10Y,c}+s_c,\qquad WACC_c=(1-w_D)k_{E,c}+w_Dk_{D,c}(1-T)")
-    st.markdown("**Interpretation:** All rates use the same project beta, ERP, tax rate and debt/equity weights. We proxy each currency's base rate with its 10-year sovereign yield. The automatic spread rule is an *explicit modeling convention* that preserves the USD debt premium after a gross-rate currency translation; it is not an observed local-currency BBB credit spread. Local sovereign risk, currency hedging costs, country risk premia, and cross-currency basis are **not** separately modeled. A different formula supplied in class should supersede this illustrative convention.")
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def norm_country(name: str) -> str:
+    c = str(name).strip().lower()
+    c = re.sub(r"\(.*?\)", "", c)
+    c = re.sub(r"\s+", " ", c).strip()
+    c = c.replace(" 10y", "").strip()
+    return ALIASES.get(c, c)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_page(url: str) -> str:
-    response = requests.get(url, timeout=18, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"})
-    response.raise_for_status()
-    if not response.text.strip():
-        raise ValueError(f"Empty HTML response from {url}")
-    return response.text
+def to_decimal(x) -> float | None:
+    """Parse '21.00%', '1.11 %', 0.21, '4.25' into a decimal rate."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    if isinstance(x, (int, float, np.number)):
+        v = float(x)
+        return v / 100 if abs(v) > 1.5 else v
+    s = str(x).strip().replace(",", "")
+    has_pct = "%" in s
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    v = float(m.group())
+    if has_pct or abs(v) > 1.5:
+        v /= 100
+    return v
 
 
-def damodaran_publication_date(url: str) -> str:
-    """Return only an explicitly labeled date on Damodaran's source page.
+def http_get(urls: list[str], timeout: int = 25) -> tuple[requests.Response, str]:
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r, url
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise RuntimeError(f"All URLs failed: {last_err}")
 
-    This is a dataset publication / analysis date, NOT a market quote time.
-    An absent/unparseable date is shown as unavailable rather than guessed.
-    """
+
+def last_modified(r: requests.Response) -> str | None:
+    lm = r.headers.get("Last-Modified")
+    if not lm:
+        return None
     try:
-        soup = BeautifulSoup(get_page(url), "html.parser")
-        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-        month = (r"(?:January|February|March|April|May|June|July|August|"
-                 r"September|October|November|December)")
-        date = rf"{month}\s+(?:\d{{1,2}},?\s+)?20\d{{2}}"
-        patterns = [
-            rf"Last\s+updated\s*:\s*({date})",
-            rf"Date\s+of\s+Analysis\s*:\s*Data\s+used\s+is\s+as\s+of\s+({date})",
-            rf"Date\s+of\s+Analysis\s*:\s*({date})",
-        ]
-        for pattern in patterns:
-            found = re.search(pattern, text, flags=re.I)
-            if found:
-                return found.group(1)
-    except Exception:
-        pass
-    return "Not available"
+        return parsedate_to_datetime(lm).strftime("%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        return lm
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def damodaran_dates() -> dict[str, str]:
-    return {
-        "betas": damodaran_publication_date(BETAS_HTML),
-        "tax": damodaran_publication_date(TAX_URL),
-        "spread": damodaran_publication_date(SPREAD_URL),
-    }
+DATE_RE = re.compile(
+    r"(?:last\s+)?updated(?:\s+(?:in|on|as of))?\s*:?\s*"
+    r"([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|[A-Za-z]+\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
+    re.IGNORECASE,
+)
 
 
-def parse_rate(value) -> float:
-    """Return percentage point value (e.g. '25%' -> 25.0)."""
-    v = str(value).replace(",", "").replace("%", "").strip()
-    if v.lower() in {"", "nan", "na", "n/a", "none"}:
-        raise ValueError("Missing rate")
-    return float(v)
+def page_date(text: str) -> str | None:
+    m = DATE_RE.search(text)
+    return m.group(1).strip() if m else None
 
 
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in out.columns]
-    return out
+def now_str() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def beta_from_html(html: str) -> pd.DataFrame:
-    for raw in pd.read_html(BytesIO(html.encode("utf-8"))):
-        df = clean_columns(raw)
-        inds = next((c for c in df if "industry name" in c), None)
-        betas = next((c for c in df if c == "unlevered beta"), None)
-        if inds and betas:
-            table = pd.DataFrame({"Industry": df[inds].astype(str).str.strip(),
-                                  "Unlevered beta": pd.to_numeric(df[betas], errors="coerce")})
-            return table.dropna().query("`Unlevered beta` >= 0").drop_duplicates("Industry").reset_index(drop=True)
-    raise ValueError("Couldn't locate the industry/unlevered-beta table")
+def flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [
+        " ".join(str(p) for p in c if "Unnamed" not in str(p)).strip()
+        if isinstance(c, tuple) else str(c)
+        for c in df.columns
+    ]
+    return df
 
 
-def load_betas() -> tuple[pd.DataFrame, str]:
-    try:
-        r = requests.get(BETAS_XLS, timeout=18, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        xls = pd.ExcelFile(BytesIO(r.content))
-        for sheet in xls.sheet_names:
-            for row in range(0, 12):
-                df = pd.read_excel(xls, sheet_name=sheet, header=row)
-                df.columns = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in df.columns]
-                name = next((c for c in df if c == "industry name"), None)
-                beta = next((c for c in df if c == "unlevered beta"), None)
-                if name and beta:
-                    result = pd.DataFrame({"Industry": df[name].astype(str).str.strip(),
-                                           "Unlevered beta": pd.to_numeric(df[beta], errors="coerce")})
-                    result = result.dropna().query("`Unlevered beta` >= 0").drop_duplicates("Industry")
-                    if len(result) > 20:
-                        return result.reset_index(drop=True), BETAS_XLS
-    except Exception:
-        pass
-    return beta_from_html(get_page(BETAS_HTML)), BETAS_HTML
-
-
-def parse_country_taxes(html: str) -> dict[str, float]:
-    """Read the country/tax column, tolerating nonstandard Damodaran HTML.
-
-    First match explicit header columns. If the HTML uses unusual headers,
-    parse country rows by their published ordering: country, Moody's rating,
-    adjusted default spread, country risk premium, ERP, corporate tax rate.
-    Fail rather than silently returning an unvalidated column.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-    for tr in soup.find_all("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"], recursive=False)]
-        if cells:
-            rows.append(cells)
-
-    def norm(value):
-        return re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
-
-    # First strategy: explicitly identify the table column names.
-    for i, row in enumerate(rows):
-        normalized = [norm(c) for c in row]
-        country_idx = next((j for j, c in enumerate(normalized) if c == "country"), None)
-        tax_idx = next((j for j, c in enumerate(normalized)
-                        if "corporate" in c and "tax" in c and "rate" in c), None)
-        if country_idx is None or tax_idx is None:
-            continue
-        result = {}
-        for candidate in rows[i+1:]:
-            if len(candidate) <= max(country_idx, tax_idx):
-                continue
-            country_name = candidate[country_idx].strip()
-            try:
-                value = parse_rate(candidate[tax_idx])
-            except (TypeError, ValueError):
-                continue
-            if country_name and 0 <= value <= 100:
-                result[country_name] = value
-        if len(result) >= 10:
-            return result
-
-    # Second strategy: rows may render as a single combined text element.
-    # Moody's ratings and the FOUR consecutive percentage columns give a
-    # structural validation: the fourth is the corporate tax rate.
-    rating = r"(?:Aaa|Aa[123]|A[123]|Baa[123]|Ba[123]|B[123]|Caa[123]|Ca|C|NR)"
-    pct = r"(-?\d+(?:\.\d+)?)\s*%"
-    row_re = re.compile(
-        rf"^(.+?)\s+({rating})\s+{pct}\s+{pct}\s+{pct}\s+{pct}(?:\s|$)",
-        re.I,
-    )
-    result = {}
-    for row in rows:
-        joined = " ".join(row)
-        joined = re.sub(r"\s+", " ", joined).strip()
-        match = row_re.match(joined)
-        if match:
-            country_name = match.group(1).strip()
-            value = float(match.group(6))
-            if country_name and 0 <= value <= 100:
-                result[country_name] = value
-    if len(result) >= 10:
-        return result
-
-    sample = [" | ".join(row[:8])[:160] for row in rows[:4]]
-    raise ValueError(
-        f"Tax-rate table was not identified ({len(rows)} HTML rows; "
-        f"{len(result)} rating-pattern matches). First rows: {sample}"
-    )
-
-
-def load_tax() -> dict[str, float]:
-    return parse_country_taxes(get_page(TAX_URL))
-
-
-def load_bbb_spread() -> float:
-    """Use large non-financial-firm BBB (Baa2/BBB) default spread, percent points."""
-    soup = BeautifulSoup(get_page(SPREAD_URL), "html.parser")
-    for row in soup.select("tr"):
-        cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"], recursive=False)]
-        if any(re.search(r"\bBaa2\s*/\s*BBB\b", c, flags=re.I) for c in cells):
-            # In Damodaran table, first spread to the right of the FIRST BBB rating belongs to non-financials.
-            idx = next(i for i, c in enumerate(cells) if re.search(r"\bBaa2\s*/\s*BBB\b", c, re.I))
-            for c in cells[idx+1:]:
-                m = re.search(r"(-?\d+(?:\.\d+)?)\s*%", c)
-                if m:
-                    return float(m.group(1))
-    raise ValueError("BBB spread was not found in Damodaran's ratings table")
-
-
-def parse_te_bonds_table(html: str) -> dict[str, tuple[float, str]]:
-    """Read 10-year government yields from Trading Economics' /bonds tables.
-
-    The real page has multi-row region headings (Major10Y, Europe, etc.),
-    extra blank/flag cells, and sometimes a Date column that is not in the
-    first HTML header row. Country cells may therefore not occupy column 0.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    output: dict[str, tuple[float, str]] = {}
-    debug_rows = []
-
-    def clean(value: str) -> str:
-        return re.sub(r"\s+", " ", value).strip()
-
-    # Do not infer an unavailable year from an abbreviated date.
-    date_pattern = re.compile(
-        r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-        r"/\d{1,2}(?:/\d{2,4})?$", re.I
-    )
-    numeric_pattern = re.compile(r"^-?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?$")
-    supported = {name.casefold(): name for name in COUNTRY_CURRENCIES}
-
-    for table in soup.find_all("table"):
-        header_yield_col = None
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["td", "th"], recursive=False)
-            if not cells:
-                continue
-            values = [clean(c.get_text(" ", strip=True)) for c in cells]
-            if len(debug_rows) < 8:
-                debug_rows.append(values[:10])
-            lower = [v.casefold() for v in values]
-            if "yield" in lower and any(
-                x in lower for x in ("major10y", "europe", "america", "asia", "africa", "oceania")
-            ):
-                header_yield_col = lower.index("yield")
-                continue
-
-            # Locate the country in *any* cell, not just the first. TE often
-            # has a leading blank cell containing a flag / sorting marker.
-            country_col = None
-            for idx, value in enumerate(values):
-                if value.casefold() in supported:
-                    country_col = idx
-                    break
-            if country_col is None:
-                continue
-            country = supported[values[country_col].casefold()]
-
-            # The yield is normally the first numeric field after country;
-            # prefer the named header position when it aligns with the row.
-            candidates = list(range(country_col + 1, min(len(values), country_col + 5)))
-            if header_yield_col is not None:
-                candidates.append(header_yield_col)
-            quote = None
-            for idx in dict.fromkeys(candidates):
-                if idx <= country_col or idx >= len(values):
-                    continue
-                token = values[idx].replace("%", "").replace(",", "")
-                if not numeric_pattern.fullmatch(values[idx]):
-                    continue
-                try:
-                    parsed = float(token)
-                except ValueError:
-                    continue
-                if -20 <= parsed <= 100:
-                    quote = parsed
-                    break
-            if quote is None:
-                continue
-
-            dates = [v for v in values if date_pattern.fullmatch(v)]
-            observation_date = dates[-1] + " (year not shown)" if dates else "Not available"
-            output.setdefault(country, (quote, observation_date))
-
-    if "United States" not in output or len(output) < 12:
-        title = soup.title.get_text(" ", strip=True) if soup.title else "No HTML title"
-        raise ValueError(
-            f"Bonds table parse failed: {len(output)} recognized countries; "
-            f"{len(soup.find_all('table'))} HTML tables; title={title[:90]!r}; "
-            f"sample HTML rows={debug_rows[:5]!r}. "
-            "HTML may have an unexpected row/cell structure."
-        )
-    return output
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_te_bonds() -> dict[str, tuple[float, str]]:
-    return parse_te_bonds_table(get_page(TE_BONDS_URL))
-
-
-def tax_lookup(table: dict[str, float], country: str) -> float | None:
-    """Match published tax-country names without relying on exact spelling."""
-    def norm(value):
-        return re.sub(r"[^a-z0-9]", "", value.casefold())
-    by_normalized = {norm(k): v for k, v in table.items()}
-    for candidate in (country, *COUNTRY_ALIASES.get(country, ())):
-        if norm(candidate) in by_normalized:
-            return by_normalized[norm(candidate)]
+def promote_header(df: pd.DataFrame, keyword: str) -> pd.DataFrame | None:
+    """Return df whose header contains `keyword`, promoting a body row if needed."""
+    df = flatten_cols(df)
+    if any(keyword in c.lower() for c in df.columns):
+        return df
+    for i in range(min(8, len(df))):
+        row = [str(v) for v in df.iloc[i].tolist()]
+        if any(keyword in v.lower() for v in row):
+            new = df.iloc[i + 1:].copy()
+            new.columns = row
+            return new
     return None
 
 
-def calculate(beta_u: float, debt_weight: float, tax: float, erp: float,
-              rf_us: float, rf_foreign: float, spread_us: float,
-              spread_fc_override: float | None = None) -> dict[str, float]:
-    """Arguments are percentages except beta and debt weight (0 to 1).
-
-    Foreign spread uses multiplicative currency conversion of the *total* debt rate.
-    This is a modeling convention; sovereign risk / CIP basis are not modeled.
-    """
-    assert 0 <= debt_weight < 1 and 0 <= tax <= 100
-    d_e = debt_weight / (1 - debt_weight)
-    beta_l = beta_u * (1 + (1 - tax / 100) * d_e)
-    cost_e_us = rf_us + beta_l * erp
-    cost_e_fc = rf_foreign + beta_l * erp
-    cost_d_us = rf_us + spread_us
-    # Same USD credit component translated with relative gross base yields.
-    spread_fc_auto = spread_us * (100 + rf_foreign) / (100 + rf_us)
-    spread_fc = spread_fc_auto if spread_fc_override is None else spread_fc_override
-    cost_d_fc = rf_foreign + spread_fc
-    wacc_us = (1 - debt_weight) * cost_e_us + debt_weight * cost_d_us * (1 - tax / 100)
-    wacc_fc = (1 - debt_weight) * cost_e_fc + debt_weight * cost_d_fc * (1 - tax / 100)
-    return dict(beta_l=beta_l, spread_fc_auto=spread_fc_auto, spread_fc=spread_fc,
-                cost_e_us=cost_e_us, cost_e_fc=cost_e_fc,
-                cost_d_us=cost_d_us, cost_d_fc=cost_d_fc,
-                wacc_us=wacc_us, wacc_fc=wacc_fc)
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_damodaran():
-    results, errors = {}, {}
-    for key, fn in (("betas", load_betas), ("tax", load_tax), ("spread", load_bbb_spread)):
-        try:
-            results[key] = fn()
-        except Exception as exc:
-            errors[key] = str(exc)
-    return results, errors
-
-
-st.sidebar.header("Parameters & overrides")
-refresh = st.sidebar.button("↻ Refresh external data", help="Clears cached Damodaran inputs and reloads the Trading Economics snapshot")
-if refresh:
-    get_damodaran.clear()
-    damodaran_dates.clear()
-    get_page.clear()
-    load_te_bonds.clear()
-    st.rerun()
-with st.spinner("Reading published data..."):
-    sources, errors = get_damodaran()
-    published_dates = damodaran_dates()
+# --------------------------------------------------------------------------- #
+# Data fetchers (cached; refresh button clears the cache)
+# --------------------------------------------------------------------------- #
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_betas() -> tuple[pd.DataFrame, dict]:
+    r, url = http_get(BETA_URLS)
+    content = io.BytesIO(r.content)
     try:
-        te_quotes = load_te_bonds()
-        te_error = None
-    except Exception as exc:
-        te_quotes = {}
-        te_error = str(exc)
+        xls = pd.ExcelFile(content, engine="xlrd")
+    except Exception:  # noqa: BLE001
+        content.seek(0)
+        xls = pd.ExcelFile(content, engine="openpyxl")
 
-if errors:
-    st.sidebar.warning("Some Damodaran inputs are unavailable; use the manual inputs below. " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+    sheet = next((s for s in xls.sheet_names if "industry" in s.lower()), xls.sheet_names[-1])
+    raw = pd.read_excel(xls, sheet_name=sheet, header=None)
 
-all_betas = sources.get("betas", (pd.DataFrame(), ""))[0]
-industries = all_betas["Industry"].tolist() if len(all_betas) else ["Software (System & Application)"]
-preferred = "Software (System & Application)"
-st.sidebar.markdown("### Project selection")
-industry = st.sidebar.selectbox("U.S. industry", industries, index=industries.index(preferred) if preferred in industries else 0)
-tax_table = sources.get("tax", {})
-# On success use ONLY countries actually found in the 10Y table. When the
-# external service is temporarily unavailable, use names previously verified
-# on /bonds (never inferred URLs), with manually entered yields.
-te_available = list(te_quotes) if te_quotes else list(COUNTRY_CURRENCIES)
-country_options = sorted(c for c in te_available
-                         if tax_lookup(tax_table, c) is not None or not tax_table)
-if not country_options:
-    st.error("No countries can be matched between the tax and 10Y datasets. Refresh the data.")
-    st.stop()
-country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)",
-                               country_options, index=country_options.index("United States") if "United States" in country_options else 0)
-currency = COUNTRY_CURRENCIES[country]
-if te_error:
-    st.sidebar.warning("Trading Economics 10Y table unavailable from this server. Enter yields manually; see retrieval details below.")
+    # Locate header row ("Industry Name")
+    hdr = None
+    for i in range(min(40, len(raw))):
+        if any(str(v).strip().lower() == "industry name" for v in raw.iloc[i].tolist()):
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError("Header 'Industry Name' not found in betas.xls")
 
-industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered beta"]) if len(all_betas) and industry in all_betas["Industry"].values else None
-# Like published tax and BBB spread, the industry beta defaults to the
-# Damodaran value. Manual editing is explicitly opt-in (or a data fallback).
-st.sidebar.markdown("### Unlevered beta")
-if industry_beta is not None:
-    st.sidebar.markdown(f"**{industry_beta:.3f}** · Damodaran · Date: {published_dates['betas']}")
-    beta_override = st.sidebar.checkbox("Override unlevered beta", value=False, key="override_beta")
-else:
-    st.sidebar.warning("Published unlevered beta unavailable; enter a value below.")
-    beta_override = True
-if beta_override:
-    beta_u = st.sidebar.number_input(
-        "Project unlevered beta", min_value=0.0, max_value=10.0,
-        value=float(industry_beta) if industry_beta is not None else 1.0,
-        step=0.05, format="%.3f", key=f"manual_beta_{industry}",
-        help="Use a manual beta only for a deliberate override or when Damodaran data is unavailable."
+    cols = [str(c).strip() for c in raw.iloc[hdr].tolist()]
+    body = raw.iloc[hdr + 1:].reset_index(drop=True)
+    body.columns = range(len(cols))
+    low = [c.lower() for c in cols]
+
+    i_name = low.index("industry name")
+    i_beta = next((j for j, c in enumerate(low) if c == "unlevered beta"), None)
+    if i_beta is None:
+        i_beta = next(j for j, c in enumerate(low) if "unlevered beta" in c and "cash" not in c)
+
+    df = pd.DataFrame({
+        "Industry": body[i_name].astype(str).str.strip(),
+        "Unlevered beta": pd.to_numeric(body[i_beta], errors="coerce"),
+    }).dropna()
+    df = df[(df["Industry"] != "nan") & (df["Industry"] != "")]
+    df = df[~df["Industry"].str.lower().str.startswith("total market")]
+    df = df.drop_duplicates("Industry").reset_index(drop=True)
+
+    # Date stated inside the workbook
+    date_txt = None
+    for i in range(hdr):
+        row = raw.iloc[i].tolist()
+        for j, v in enumerate(row):
+            if isinstance(v, str) and "date" in v.lower():
+                for w in row[j + 1:]:
+                    if pd.notna(w) and str(w).strip():
+                        date_txt = (w.strftime("%Y-%m-%d") if hasattr(w, "strftime") else str(w))
+                        break
+            if date_txt:
+                break
+        if date_txt:
+            break
+
+    meta = {
+        "url": url,
+        "as_of": date_txt or last_modified(r) or "n/a",
+        "fetched": now_str(),
+        "note": f"Sheet '{sheet}', column '{cols[i_beta]}'",
+    }
+    return df, meta
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_tax() -> tuple[dict, dict]:
+    r, url = http_get(TAX_URLS)
+    tables = pd.read_html(io.StringIO(r.text))
+    best = None
+    for t in tables:
+        t2 = promote_header(t, "tax")
+        if t2 is not None and len(t2) > 20:
+            best = t2
+            break
+    if best is None:
+        raise ValueError("Corporate tax column not found in ctryprem.html")
+
+    cols = [str(c) for c in best.columns]
+    i_tax = next(j for j, c in enumerate(cols) if "tax" in c.lower())
+    i_cty = next((j for j, c in enumerate(cols) if "country" in c.lower()), 0)
+
+    out = {}
+    for _, row in best.iterrows():
+        name = str(row.iloc[i_cty]).strip()
+        val = to_decimal(row.iloc[i_tax])
+        if not name or name.lower() == "nan" or val is None:
+            continue
+        if 0 <= val < 1:
+            out[name] = val
+    if not out:
+        raise ValueError("No tax rates parsed")
+
+    meta = {
+        "url": url,
+        "as_of": page_date(BeautifulSoup(r.text, "lxml").get_text(" ")) or last_modified(r) or "n/a",
+        "fetched": now_str(),
+        "note": f"Column '{cols[i_tax]}'",
+    }
+    return out, meta
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_spread() -> tuple[float, dict]:
+    r, url = http_get(RATING_URLS)
+    soup = BeautifulSoup(r.text, "lxml")
+    spread = None
+    # First table on the page = large non-financial service firms.
+    # Find the first row containing 'Baa2/BBB' and take the next % cell after it.
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        keys = [re.sub(r"\s+", "", c).lower() for c in cells]
+        if "baa2/bbb" in keys:
+            k = keys.index("baa2/bbb")
+            for c in cells[k + 1:]:
+                v = to_decimal(c)
+                if v is not None and 0 < v < 0.2:
+                    spread = v
+                    break
+        if spread is not None:
+            break
+    if spread is None:
+        raise ValueError("Baa2/BBB spread not found in ratings.html")
+
+    meta = {
+        "url": url,
+        "as_of": page_date(soup.get_text(" ")) or last_modified(r) or "n/a",
+        "fetched": now_str(),
+        "note": "Baa2/BBB, large non-financial service firms (first table)",
+    }
+    return spread, meta
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_yields() -> tuple[pd.DataFrame, dict]:
+    r = requests.get(TE_URL, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+
+    rows, seen = [], set()
+    for tr in soup.find_all("tr"):
+        a = tr.find("a", href=True)
+        if not a or "bond-yield" not in a["href"].lower():
+            continue
+        tds = tr.find_all("td")
+        texts = [td.get_text(" ", strip=True) for td in tds]
+        name = a.get_text(" ", strip=True)
+        if not name:
+            slug = a["href"].strip("/").split("/")[0]
+            name = slug.replace("-", " ").title()
+        name = re.sub(r"\s*10Y$", "", name).strip()
+        # yield = first numeric cell after the name cell
+        y = None
+        start = next((i for i, t in enumerate(texts) if name.lower() in t.lower()), 0)
+        for t in texts[start + 1:]:
+            try:
+                y = float(t.replace(",", "").replace("%", ""))
+                break
+            except ValueError:
+                continue
+        if y is None:
+            continue
+        key = norm_country(name)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"Country": name, "Yield": y / 100, "Date": texts[-1] if texts else ""})
+
+    # Fallback: generic table parse
+    if not rows:
+        for t in pd.read_html(io.StringIO(r.text)):
+            t = flatten_cols(t)
+            ycol = next((c for c in t.columns if c.lower() == "yield"), None)
+            if ycol is None:
+                continue
+            dcol = next((c for c in t.columns if c.lower() == "date"), None)
+            for _, row in t.iterrows():
+                name = re.sub(r"\s*10Y$", "", str(row.iloc[0])).strip()
+                try:
+                    y = float(row[ycol]) / 100
+                except (TypeError, ValueError):
+                    continue
+                key = norm_country(name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"Country": name, "Yield": y, "Date": str(row[dcol]) if dcol else ""})
+
+    if not rows:
+        raise ValueError("No yields parsed from Trading Economics")
+    df = pd.DataFrame(rows)
+    meta = {"url": TE_URL, "as_of": "per-country 'Date' column", "fetched": now_str(),
+            "note": "10-year government bond yields"}
+    return df, meta
+
+
+def load_all():
+    status = {}
+
+    try:
+        betas, m = fetch_betas(); status["betas"] = (True, m, None)
+    except Exception as e:  # noqa: BLE001
+        betas = pd.DataFrame({"Industry": list(FALLBACK_BETAS), "Unlevered beta": list(FALLBACK_BETAS.values())})
+        status["betas"] = (False, {"url": BETA_URLS[0], "as_of": "placeholder", "fetched": now_str(), "note": ""}, str(e))
+
+    try:
+        tax, m = fetch_tax(); status["tax"] = (True, m, None)
+    except Exception as e:  # noqa: BLE001
+        tax = dict(FALLBACK_TAX)
+        status["tax"] = (False, {"url": TAX_URLS[0], "as_of": "placeholder", "fetched": now_str(), "note": ""}, str(e))
+
+    try:
+        spread, m = fetch_spread(); status["spread"] = (True, m, None)
+    except Exception as e:  # noqa: BLE001
+        spread = FALLBACK_SPREAD
+        status["spread"] = (False, {"url": RATING_URLS[0], "as_of": "placeholder", "fetched": now_str(), "note": ""}, str(e))
+
+    try:
+        yields, m = fetch_yields(); status["yields"] = (True, m, None)
+    except Exception as e:  # noqa: BLE001
+        yields = pd.DataFrame([{"Country": k, "Yield": v, "Date": "placeholder"} for k, v in FALLBACK_YIELDS.items()])
+        status["yields"] = (False, {"url": TE_URL, "as_of": "placeholder", "fetched": now_str(), "note": ""}, str(e))
+
+    return betas, tax, spread, yields, status
+
+
+# --------------------------------------------------------------------------- #
+# Core model
+# --------------------------------------------------------------------------- #
+def compute(beta_u, tax, w_d, erp, r_usd, r_fc, s_usd, s_fc_override=None) -> dict:
+    """All inputs in decimals. Returns a dict of results in decimals."""
+    de = w_d / (1 - w_d)
+    beta_l = beta_u * (1 + (1 - tax) * de)
+    s_fc_auto = s_usd * (1 + r_fc) / (1 + r_usd)
+    s_fc = s_fc_override if s_fc_override is not None else s_fc_auto
+
+    res = {"de": de, "beta_l": beta_l, "s_fc_auto": s_fc_auto, "s_fc": s_fc}
+    for cur, r, s in (("USD", r_usd, s_usd), ("FC", r_fc, s_fc)):
+        ke = r + beta_l * erp
+        kd = r + s
+        kd_after = kd * (1 - tax)
+        wacc = (1 - w_d) * ke + w_d * kd_after
+        res[cur] = {"rf": r, "spread": s, "ke": ke, "kd": kd, "kd_after": kd_after, "wacc": wacc}
+    return res
+
+
+def pct(x: float, d: int = 2) -> str:
+    return f"{x * 100:.{d}f}%"
+
+
+# --------------------------------------------------------------------------- #
+# Load data
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.header("Data")
+    if st.button("🔄 Refresh data", help="Clear the cache and re-fetch all sources"):
+        st.cache_data.clear()
+        st.rerun()
+
+with st.spinner("Fetching data from Damodaran and Trading Economics…"):
+    betas_df, tax_map, usd_spread_fetched, yields_df, status = load_all()
+
+tax_norm = {norm_country(k): (k, v) for k, v in tax_map.items()}
+yld_norm = {norm_country(r.Country): (r.Country, r.Yield, r.Date) for r in yields_df.itertuples()}
+
+with st.sidebar:
+    n_ok = sum(1 for v in status.values() if v[0])
+    if n_ok == 4:
+        st.success("All 4 sources loaded.")
+    else:
+        st.warning(f"{n_ok}/4 sources loaded. Failed sources use placeholders — use the manual overrides below.")
+
+# Country list: Trading Economics countries first (they have yields), then Damodaran-only
+country_names = {}
+for k, (name, _, _) in yld_norm.items():
+    country_names[k] = name
+for k, (name, _) in tax_norm.items():
+    country_names.setdefault(k, name)
+country_names.setdefault("united states", "United States")
+country_list = sorted(country_names.values(), key=str.lower)
+
+industry_list = betas_df["Industry"].tolist()
+
+# --------------------------------------------------------------------------- #
+# Sidebar inputs
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.header("Project inputs")
+    ind_idx = next((i for i, s in enumerate(industry_list) if s.lower() == DEFAULT_INDUSTRY.lower()), 0)
+    industry = st.selectbox("Industry", industry_list, index=ind_idx)
+
+    cty_idx = next((i for i, s in enumerate(country_list) if norm_country(s) == "united states"), 0)
+    country = st.selectbox("Target country", country_list, index=cty_idx)
+    ckey = norm_country(country)
+    ccy = CURRENCY.get(ckey, "local currency")
+
+    erp = st.number_input("Equity risk premium (%)", 0.0, 20.0, DEFAULT_ERP, 0.1, format="%.2f") / 100
+    w_d = st.slider("Target debt share D/(D+E) (%)", 0.0, 90.0, DEFAULT_DEBT, 1.0) / 100
+
+    tax_choice = st.radio(
+        "Project tax rate",
+        ["U.S. corporate tax rate", f"{country} corporate tax rate"],
+        index=0,
+        help="The same tax rate is used for both currencies.",
     )
-else:
-    beta_u = float(industry_beta)
-st.sidebar.markdown("### Equity risk premium")
-erp = st.sidebar.number_input("ERP (%)", 0.0, 40.0, 6.5, 0.25)
-st.sidebar.markdown("### Financing ratio")
-debt_pct = st.sidebar.slider("Debt share of total capital (%)", 0, 95, 30)
-st.sidebar.caption(f"Debt: {debt_pct}% · Equity: {100-debt_pct}% · D/E: {debt_pct / (100-debt_pct):.3f}")
 
-# Load both tax rates from the same country table. The United States is a
-# fixed baseline, not a selectable target-market replacement.
-tax_table = sources.get("tax", {})
-published_us_tax = tax_lookup(tax_table, "United States")
-published_target_tax = tax_lookup(tax_table, country)
-published_spread = sources.get("spread")
+# Fetched values
+beta_u_f = float(betas_df.loc[betas_df["Industry"] == industry, "Unlevered beta"].iloc[0])
+us_tax_f = tax_norm.get("united states", (None, FALLBACK_TAX["United States"]))[1]
+fc_tax_f = tax_norm.get(ckey, (None, None))[1]
+us_y_f = yld_norm.get("united states", (None, FALLBACK_YIELDS["United States"], ""))[1]
+fc_y_entry = yld_norm.get(ckey)
+fc_y_f = fc_y_entry[1] if fc_y_entry else None
 
-st.sidebar.markdown("### Project tax rate")
-st.sidebar.caption("One project tax rate applies to both currencies.")
-tax_jurisdiction = st.sidebar.radio(
-    "Project taxable in", ["Target country", "United States"],
-    index=0, horizontal=False,
-    help="This selects a single tax rate used in both USD and foreign-currency calculations."
-)
-tax_country = country if tax_jurisdiction == "Target country" else "United States"
-published_tax = published_target_tax if tax_jurisdiction == "Target country" else published_us_tax
+# --------------------------------------------------------------------------- #
+# Manual overrides
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.header("Manual overrides")
+    st.caption("Tick a box to replace the fetched value.")
 
-# Published Damodaran values are used automatically. Overrides only appear
-# when the user explicitly requests one, or when downloading fails.
-if published_tax is not None:
-    st.sidebar.markdown(f"**{published_tax:.2f}%** · {tax_country} (Damodaran) · Date: {published_dates['tax']}")
-    tax_override = st.sidebar.checkbox("Override corporate tax rate", value=False, key="override_tax")
-else:
-    st.sidebar.warning(f"No published tax rate available for {tax_country}; enter a value below.")
-    tax_override = True
-if tax_override:
-    tax = st.sidebar.number_input("Project corporate tax rate (%)", 0.0, 100.0,
-                                  value=float(published_tax) if published_tax is not None else 25.0,
-                                  step=0.5, key=f"manual_tax_{tax_country}")
-else:
-    tax = float(published_tax)
+    def override(label, fetched, key, default_on=False, lo=-5.0, hi=100.0, step=0.01, is_pct=True):
+        on = st.checkbox(f"Override {label}", value=default_on, key=f"on_{key}")
+        shown = (fetched * 100 if is_pct else fetched) if fetched is not None else 0.0
+        if on:
+            v = st.number_input(
+                f"{label}{' (%)' if is_pct else ''}", lo, hi, float(round(shown, 4)), step,
+                format="%.4f" if not is_pct else "%.3f", key=f"val_{key}",
+            )
+            return (v / 100 if is_pct else v), True
+        return fetched, False
 
-st.sidebar.markdown("### BBB borrowing spreads")
-st.sidebar.markdown("**USD BBB spread**")
-if published_spread is not None:
-    st.sidebar.markdown(f"**{published_spread:.3f}%** · Damodaran · Date: {published_dates['spread']}")
-    spread_override = st.sidebar.checkbox("Override USD BBB spread", value=False, key="override_us_spread")
-else:
-    st.sidebar.warning("Published BBB USD spread unavailable; enter a value below.")
-    spread_override = True
-if spread_override:
-    spread_us = st.sidebar.number_input("BBB USD borrowing spread (%)", 0.0, 30.0,
-                                        value=float(published_spread) if published_spread is not None else 1.11,
-                                        step=0.05, key="manual_us_spread")
-else:
-    spread_us = float(published_spread)
+    beta_u, ov_beta = override("unlevered beta", beta_u_f, f"beta_{industry}", lo=0.0, hi=5.0, is_pct=False)
+    us_tax, ov_ustax = override("U.S. corporate tax rate", us_tax_f, "ustax", lo=0.0, hi=60.0)
+    fc_tax, ov_fctax = override(
+        f"{country} corporate tax rate", fc_tax_f if fc_tax_f is not None else us_tax,
+        f"fctax_{ckey}", default_on=fc_tax_f is None, lo=0.0, hi=60.0,
+    )
+    s_usd, ov_susd = override("USD BBB spread", usd_spread_fetched, "susd", lo=0.0, hi=20.0)
+    r_usd, ov_rusd = override("U.S. 10Y yield", us_y_f, "rusd", lo=-2.0, hi=50.0)
+    r_fc, ov_rfc = override(
+        f"{country} 10Y yield", fc_y_f if fc_y_f is not None else r_usd,
+        f"rfc_{ckey}", default_on=fc_y_f is None, lo=-2.0, hi=100.0,
+    )
 
-# Reserve the next sidebar position for the converted BBB spread. Its value
-# depends on both government yields, which are collected further below.
-# A Streamlit container lets us render the calculation here once inputs exist.
-foreign_bbb_section = st.sidebar.container()
+    # Keep the U.S. as one country: if the target is the U.S., FC yield/tax follow U.S. unless overridden
+    if ckey == "united states":
+        if not ov_rfc:
+            r_fc = r_usd
+        if not ov_fctax:
+            fc_tax = us_tax
 
-# Yield inputs: concise sidebar display; provenance is listed separately below.
-st.sidebar.markdown("### 10-year government yields")
-# One verified table feeds BOTH countries; no per-country URL guessing.
-def resolve_yield(country_name: str):
-    record = te_quotes.get(country_name)
-    if record is None:
-        return None, None, None, te_error or f"No {country_name} quote on the 10Y table"
-    value, date = record
-    return value, date, "Trading Economics /bonds", None
-
-us_value, us_source_date, us_source, us_error = resolve_yield("United States")
-fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country)
-
-# Show the retrieved value and its observation date before optional editing.
-def yield_control(label: str, quote: float | None, source_date: str | None,
-                  override_key: str, value_key: str, date_key: str,
-                  fallback: float) -> tuple[float, str, bool]:
-    st.sidebar.markdown(f"**{label}**")
-    if quote is not None:
-        st.sidebar.caption(f"Trading Economics: **{quote:.4f}%** · Date: {source_date or 'unverified'}")
-        manual = st.sidebar.checkbox(f"Override {label} yield", value=False, key=override_key)
+    st.markdown("---")
+    ov_sfc = st.checkbox(f"Override {ccy} BBB spread", value=False, key="on_sfc")
+    auto_preview = s_usd * (1 + r_fc) / (1 + r_usd)
+    if ov_sfc:
+        s_fc_manual = st.number_input(
+            f"{ccy} BBB spread (%)", 0.0, 50.0, float(round(auto_preview * 100, 4)), 0.01,
+            format="%.3f", key=f"val_sfc_{ckey}",
+        ) / 100
     else:
-        st.sidebar.caption("Trading Economics: **Unavailable** · Date: unavailable")
-        st.sidebar.warning("Automatic retrieval failed; manual entry required.")
-        manual = True
-    if manual:
-        val = st.sidebar.number_input(
-            f"{label} yield (%)", min_value=-20.0, max_value=100.0,
-            value=float(quote if quote is not None else fallback), step=0.1,
-            key=value_key,
-        )
-        date = st.sidebar.text_input(f"{label} observation date", value="not provided", key=date_key)
-    else:
-        val, date = float(quote), source_date or "unverified"
-    return float(val), date, manual
+        s_fc_manual = None
+        st.caption(f"Auto-calculated {ccy} spread: **{pct(auto_preview, 3)}**")
 
-rf_us, us_date, us_manual = yield_control(
-    "United States", us_value, us_source_date, "us_manual", "us_yield", "us_date", 4.0
+if fc_y_f is None:
+    st.warning(f"No Trading Economics 10Y yield found for **{country}**. Enter it under *Manual overrides*.")
+if fc_tax_f is None:
+    st.warning(f"No Damodaran corporate tax rate found for **{country}**. Enter it under *Manual overrides*.")
+
+T = us_tax if tax_choice.startswith("U.S.") else fc_tax
+res = compute(beta_u, T, w_d, erp, r_usd, r_fc, s_usd, s_fc_manual)
+
+# --------------------------------------------------------------------------- #
+# Main page
+# --------------------------------------------------------------------------- #
+st.title("International cost of capital")
+st.write(
+    f"**{industry}** project, cost of capital in **USD** and in **{country}'s currency ({ccy})**, "
+    f"using one project beta, ERP, tax rate and capital structure."
 )
-rf_foreign, fc_date, fc_manual = yield_control(
-    country, fc_value, fc_source_date, f"fc_manual_{country}",
-    f"fc_yield_{country}", f"fc_date_{country}",
-    rf_us if country == "United States" else 3.0,
-)
-# Technical retrieval errors are shown only if automatic input fails.
-if us_error or fc_error:
-    with st.sidebar.expander("Yield retrieval details"):
-        for name, err in (("United States", us_error), (country, fc_error)):
-            if err:
-                st.caption(f"{name}: {err}")
 
-if country == "United States" and abs(rf_us - rf_foreign) > 1e-8:
-    st.sidebar.warning("Both columns use USD; set both government yields equal for currency consistency.")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Unlevered beta", f"{beta_u:.3f}", "manual" if ov_beta else None, delta_color="off")
+c2.metric("Levered beta", f"{res['beta_l']:.3f}")
+c3.metric("D/E", f"{res['de']:.3f}")
+c4.metric("Project tax rate", pct(T), tax_choice.split(" corporate")[0], delta_color="off")
+c5.metric("ERP", pct(erp))
 
-debt_weight = debt_pct / 100
-base = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us)
-with foreign_bbb_section:
-    st.markdown("**Target-currency BBB spread**")
-    st.caption(f"Automatic BBB {currency} spread: **{base['spread_fc_auto']:.3f}%**")
-    spread_override_on = st.checkbox("Override converted foreign-currency spread", value=False)
-    if spread_override_on:
-        spread_fc_override = st.number_input(
-            f"Manual BBB spread in {currency} (%)", min_value=0.0, max_value=30.0,
-            value=float(base["spread_fc_auto"]), step=0.05)
-    else:
-        spread_fc_override = None
-values = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us,
-                   spread_fc_override)
-with foreign_bbb_section:
-    st.caption(f"Used: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic conversion'})")
-
-# Present the published inputs for BOTH countries in one aligned table.
-# The tax observations are reference data; the model uses ONE project tax rate
-# in both WACC columns to isolate currency denomination, per assignment.
-st.subheader("Input audit: United States (fixed) vs. target")
-st.caption("Published tax rates are shown for BOTH jurisdictions, but the same selected project tax rate enters both calculations. U.S. industry beta and the ERP are also common to both currency calculations.")
-audit_rows = [
-    {"Input": "Currency", "United States (fixed)": "USD", f"Target: {country}": currency},
-    {"Input": "10Y sovereign yield (%)", "United States (fixed)": f"{rf_us:.4f}%", f"Target: {country}": f"{rf_foreign:.4f}%"},
-    {"Input": "Published corporate tax (%)", "United States (fixed)": f"{published_us_tax:.2f}%" if published_us_tax is not None else "unavailable", f"Target: {country}": f"{published_target_tax:.2f}%" if published_target_tax is not None else "unavailable"},
-    {"Input": "Tax actually used in BOTH WACCs (%)", "United States (fixed)": f"{tax:.2f}% ({tax_country})", f"Target: {country}": f"{tax:.2f}% ({tax_country})"},
-    {"Input": "Unlevered industry beta (U.S. industry dataset)", "United States (fixed)": f"{beta_u:.3f}", f"Target: {country}": f"{beta_u:.3f} (shared)"},
-    {"Input": "Levered project beta", "United States (fixed)": f"{values['beta_l']:.3f}", f"Target: {country}": f"{values['beta_l']:.3f} (shared)"},
-    {"Input": "Equity risk premium (%)", "United States (fixed)": f"{erp:.2f}%", f"Target: {country}": f"{erp:.2f}% (shared)"},
-    {"Input": "BBB borrowing spread (%)", "United States (fixed)": f"{spread_us:.3f}% (Damodaran / override)", f"Target: {country}": f"{values['spread_fc']:.3f}% ({'override' if spread_override_on else 'converted'})"},
-    {"Input": "Debt weight (%)", "United States (fixed)": f"{debt_pct:.0f}%", f"Target: {country}": f"{debt_pct:.0f}% (shared)"},
-    {"Input": "Equity weight (%)", "United States (fixed)": f"{100-debt_pct:.0f}%", f"Target: {country}": f"{100-debt_pct:.0f}% (shared)"},
-]
-st.dataframe(pd.DataFrame(audit_rows).set_index("Input"), width="stretch")
-st.caption("Data values and their dates appear together in the sidebar. Detailed source links are listed below.")
-
-st.subheader("Side-by-side valuation inputs")
+st.subheader("Results side by side")
 left, right = st.columns(2)
-for pane, label, suffix in ((left, "Original: United States (USD)", "us"), (right, f"Target: {country} ({currency})", "fc")):
-    with pane:
-        st.markdown(f"### {label}")
-        st.metric("Cost of equity", f"{values[f'cost_e_{suffix}']:.2f}%")
-        st.metric("Pre-tax cost of debt", f"{values[f'cost_d_{suffix}']:.2f}%")
-        st.metric("WACC", f"{values[f'wacc_{suffix}']:.2f}%")
-st.caption(f"Levered beta (shared): {values['beta_l']:.3f} | Debt weight (shared): {debt_pct:.0f}% | Equity weight (shared): {100-debt_pct:.0f}% | Project tax in BOTH calculations: {tax:.2f}% ({tax_country})")
+for col, cur, label in ((left, "USD", "USD (United States)"), (right, "FC", f"{ccy} ({country})")):
+    r = res[cur]
+    with col:
+        st.markdown(f"#### {label}")
+        a, b = st.columns(2)
+        a.metric("10Y government yield", pct(r["rf"]))
+        b.metric("BBB spread", pct(r["spread"], 3))
+        a.metric("Cost of equity", pct(r["ke"]))
+        b.metric("Pre-tax cost of debt", pct(r["kd"]))
+        a.metric("After-tax cost of debt", pct(r["kd_after"]))
+        b.metric("WACC", pct(r["wacc"]))
 
-
-st.subheader("All-industry comparison")
-if all_betas.empty:
-    st.error("Industry comparison requires the Damodaran industry-beta data. Please refresh when connected to the internet.")
-else:
-    rows = []
-    for row in all_betas.itertuples(index=False):
-        b = float(row[1])
-        z = calculate(b, debt_weight, tax, erp, rf_us, rf_foreign, spread_us,
-                      spread_fc_override if spread_override_on else None)
-        rows.append({"Industry": row[0], "Unlevered beta": b, "Levered beta": z["beta_l"],
-                     "USD cost of equity (%)": z["cost_e_us"], "USD cost of debt (%)": z["cost_d_us"],
-                     "USD WACC (%)": z["wacc_us"], f"{currency} cost of equity (%)": z["cost_e_fc"],
-                     f"{currency} cost of debt (%)": z["cost_d_fc"], f"{currency} WACC (%)": z["wacc_fc"]})
-    industry_df = pd.DataFrame(rows).sort_values("USD WACC (%)")
-    st.caption("Only industry beta varies. Country, risk-free yields, tax rate, ERP, financing weights and spreads are held constant.")
-    st.dataframe(industry_df, width="stretch", hide_index=True)
-    st.download_button("Download all-industry results (CSV)", industry_df.to_csv(index=False).encode(),
-                       file_name="international_cost_of_capital_industries.csv", mime="text/csv")
-
-selected_row = pd.DataFrame([{
-    "industry": industry, "original_country": "United States", "country": country, "currency": currency,
-    "us_published_tax_pct": published_us_tax, "target_published_tax_pct": published_target_tax,
-    "beta_data_date": published_dates["betas"], "tax_data_date": published_dates["tax"],
-    "us_bbb_data_date": published_dates["spread"],
-    "project_tax_jurisdiction": tax_country,
-    "unlevered_beta": beta_u, "levered_beta": values["beta_l"], "erp_pct": erp,
-    "debt_weight": debt_weight, "tax_pct": tax, "us_10y_yield_pct": rf_us,
-    "country_10y_yield_pct": rf_foreign, "us_bbb_spread_pct": spread_us,
-    "fc_bbb_spread_pct": values["spread_fc"], "fc_bbb_spread_override": spread_override_on,
-    "us_cost_equity_pct": values["cost_e_us"], "us_cost_debt_pct": values["cost_d_us"],
-    "us_yield_source": "manual" if us_manual else us_source, "us_observation_date": us_date,
-    "tax_source": "manual override" if tax_override else f"Damodaran ({tax_country})",
-    "us_bbb_spread_source": "manual override" if spread_override else "Damodaran",
-    "fc_yield_source": "manual" if fc_manual else fc_source, "fc_observation_date": fc_date,
-    "us_wacc_pct": values["wacc_us"], "fc_cost_equity_pct": values["cost_e_fc"],
-    "fc_cost_debt_pct": values["cost_d_fc"], "fc_wacc_pct": values["wacc_fc"],
-}])
-st.download_button("Download current project result (CSV)", selected_row.to_csv(index=False).encode(),
-                   file_name="international_cost_of_capital_project.csv", mime="text/csv")
-
-st.subheader("Data sources and provenance")
-st.markdown(
-    f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — dataset date: **{published_dates['betas']}**\n"
-    f"- [Damodaran corporate tax rates]({TAX_URL}) — dataset date: **{published_dates['tax']}**\n"
-    f"- [Damodaran BBB borrowing spread]({SPREAD_URL}) — dataset date: **{published_dates['spread']}**\n"
-    f"- [Trading Economics 10Y bond yield table]({TE_BONDS_URL}) — U.S. date: **{us_date or 'Not available'}**; {country} date: **{fc_date or 'Not available'}**"
+u, f = res["USD"], res["FC"]
+summary = pd.DataFrame(
+    {
+        "USD": [u["rf"], u["spread"], res["beta_l"], u["ke"], u["kd"], u["kd_after"], u["wacc"]],
+        ccy if ccy != "USD" else "USD (target)": [f["rf"], f["spread"], res["beta_l"], f["ke"], f["kd"], f["kd_after"], f["wacc"]],
+    },
+    index=["10Y yield", "BBB spread", "Levered beta", "Cost of equity",
+           "Pre-tax cost of debt", "After-tax cost of debt", "WACC"],
 )
-st.caption("Damodaran dates are source-reported dataset/analysis dates; Trading Economics dates are quote observation dates when verifiable. Manual-entry dates are user supplied. Missing dates are not inferred from the app retrieval time.")
-st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
-if "betas" not in sources or tax_override or spread_override or us_manual or fc_manual:
-    st.info("At least one figure is manually specified or an example fallback. Confirm source links and observation dates before submitting financial conclusions.")
+summary["Difference (target − USD)"] = summary.iloc[:, 1] - summary.iloc[:, 0]
+disp = summary.astype(object)
+for idx in disp.index:
+    if idx == "Levered beta":
+        disp.loc[idx] = [f"{v:.3f}" for v in summary.loc[idx]]
+    else:
+        disp.loc[idx] = [f"{v * 100:.3f}%" for v in summary.loc[idx]]
+st.table(disp)
+
+chart_df = pd.DataFrame(
+    {"USD": [u["ke"] * 100, u["wacc"] * 100], ccy if ccy != "USD" else "USD (target)": [f["ke"] * 100, f["wacc"] * 100]},
+    index=["Cost of equity (%)", "WACC (%)"],
+)
+st.bar_chart(chart_df)
+
+# Step-by-step calculation (for independent checking)
+with st.expander("Step-by-step calculation (use this to check by hand)"):
+    st.markdown(
+        f"""
+1. D/E = {w_d:.4f} / (1 − {w_d:.4f}) = **{res['de']:.4f}**
+2. β_L = {beta_u:.4f} × [1 + (1 − {T:.4f}) × {res['de']:.4f}] = **{res['beta_l']:.4f}**
+3. k_E,USD = {u['rf']:.4f} + {res['beta_l']:.4f} × {erp:.4f} = **{u['ke']:.4f}**
+4. k_E,{ccy} = {f['rf']:.4f} + {res['beta_l']:.4f} × {erp:.4f} = **{f['ke']:.4f}**
+5. s_{ccy} (auto) = {s_usd:.4f} × (1 + {r_fc:.4f}) / (1 + {r_usd:.4f}) = **{res['s_fc_auto']:.5f}**{"  — overridden to **" + f"{res['s_fc']:.5f}" + "**" if s_fc_manual is not None else ""}
+6. k_D,USD = {u['rf']:.4f} + {u['spread']:.4f} = **{u['kd']:.4f}**; k_D,{ccy} = {f['rf']:.4f} + {f['spread']:.5f} = **{f['kd']:.5f}**
+7. WACC_USD = (1 − {w_d:.4f}) × {u['ke']:.4f} + {w_d:.4f} × {u['kd']:.4f} × (1 − {T:.4f}) = **{u['wacc']:.5f}**
+8. WACC_{ccy} = (1 − {w_d:.4f}) × {f['ke']:.4f} + {w_d:.4f} × {f['kd']:.5f} × (1 − {T:.4f}) = **{f['wacc']:.5f}**
+"""
+    )
+
+# Assumptions
+with st.expander("Model equations and assumptions", expanded=False):
+    st.latex(r"\beta_L=\beta_U\left[1+(1-T)\frac{D}{E}\right],\qquad \frac{D}{E}=\frac{w_D}{1-w_D}")
+    st.latex(r"k_{E,c}=r_{10Y,c}+\beta_L\,ERP")
+    st.latex(r"s^{auto}_{FC}=s_{USD}\,\frac{1+r_{10Y,FC}}{1+r_{10Y,USD}}\quad\text{(rates in decimals)}")
+    st.latex(r"k_{D,c}=r_{10Y,c}+s_c,\qquad WACC_c=(1-w_D)\,k_{E,c}+w_D\,k_{D,c}\,(1-T)")
+    st.markdown(
+        """
+**Interpretation.** Both currencies use the same project beta, ERP, tax rate and debt/equity weights.
+Each currency's base rate is proxied by its 10-year government bond yield. The automatic spread rule
+is a modeling convention that keeps the USD debt premium after a gross-rate currency translation; it is
+not an observed local-currency BBB spread. Local sovereign risk, hedging costs, country risk premia and
+cross-currency basis are **not** modeled separately.
+
+* **Beta**: Damodaran U.S. industry *unlevered* beta, relevered with the Hamada equation above.
+* **Tax rate**: one project tax rate (U.S. or target country), used in relevering and in the debt tax shield.
+* **USD spread**: Damodaran's Baa2/BBB default spread for large non-financial service firms.
+* **Yields**: latest 10-year government yields on Trading Economics (may be a few minutes delayed).
+"""
+    )
+
+# Verification checks
+with st.expander("Built-in verification checks", expanded=False):
+    tol = 1e-12
+    eq = compute(beta_u, T, w_d, erp, r_usd, r_usd, s_usd, None)
+    chk1 = all(abs(eq["USD"][k] - eq["FC"][k]) < tol for k in ("ke", "kd", "wacc"))
+    z = compute(beta_u, T, 0.0, erp, r_usd, r_fc, s_usd, s_fc_manual)
+    chk2 = abs(z["USD"]["wacc"] - z["USD"]["ke"]) < tol and abs(z["FC"]["wacc"] - z["FC"]["ke"]) < tol
+    base = compute(beta_u, T, w_d, erp, r_usd, r_fc, s_usd, None)
+    ovr = compute(beta_u, T, w_d, erp, r_usd, r_fc, s_usd, base["s_fc_auto"] + 0.01)
+    chk3 = all(abs(base["USD"][k] - ovr["USD"][k]) < tol for k in ("ke", "kd", "kd_after", "wacc"))
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Check": [
+                    "Equal 10Y yields + spread override off → identical USD and FC results",
+                    "Zero debt → WACC equals cost of equity (both currencies)",
+                    "Overriding the FC spread (+1pp) leaves USD results unchanged",
+                ],
+                "Result": ["✅ Pass" if c else "❌ Fail" for c in (chk1, chk2, chk3)],
+                "Detail": [
+                    f"WACC USD {pct(eq['USD']['wacc'], 4)} vs FC {pct(eq['FC']['wacc'], 4)}",
+                    f"USD: WACC {pct(z['USD']['wacc'], 4)} = kE {pct(z['USD']['ke'], 4)}",
+                    f"USD WACC {pct(base['USD']['wacc'], 4)} → {pct(ovr['USD']['wacc'], 4)}",
+                ],
+            }
+        ),
+        hide_index=True,
+    )
+
+# --------------------------------------------------------------------------- #
+# All-industry comparison
+# --------------------------------------------------------------------------- #
+st.subheader("All-industry comparison")
+st.caption(
+    f"Every Damodaran industry with the current settings: {country}, ERP {pct(erp)}, debt {pct(w_d, 0)}, "
+    f"tax {pct(T)}. Manual beta override applies only to the selected industry."
+)
+rows = []
+for name, bu in zip(betas_df["Industry"], betas_df["Unlevered beta"]):
+    bu_used = beta_u if name == industry else float(bu)
+    rr = compute(bu_used, T, w_d, erp, r_usd, r_fc, s_usd, s_fc_manual)
+    rows.append({
+        "Industry": name,
+        "Unlevered beta": bu_used,
+        "Levered beta": rr["beta_l"],
+        "Cost of equity USD (%)": rr["USD"]["ke"] * 100,
+        f"Cost of equity {ccy} (%)": rr["FC"]["ke"] * 100,
+        "WACC USD (%)": rr["USD"]["wacc"] * 100,
+        f"WACC {ccy} (%)": rr["FC"]["wacc"] * 100,
+    })
+all_df = pd.DataFrame(rows)
+if ccy == "USD":
+    all_df = all_df.loc[:, ~all_df.columns.duplicated()]
+all_df = all_df.sort_values("WACC USD (%)", ascending=False).reset_index(drop=True)
+
+rank = int(all_df.index[all_df["Industry"] == industry][0]) + 1
+st.write(f"**{industry}** ranks **#{rank} of {len(all_df)}** by USD WACC (highest first).")
+st.dataframe(
+    all_df.style.format({c: "{:.3f}" for c in all_df.columns if c != "Industry"})
+    .apply(lambda r: ["background-color: rgba(255, 200, 0, 0.25)" if r["Industry"] == industry else "" for _ in r], axis=1),
+    hide_index=True,
+    height=420,
+)
+
+# --------------------------------------------------------------------------- #
+# Downloads
+# --------------------------------------------------------------------------- #
+st.subheader("Download results")
+inputs_df = pd.DataFrame(
+    {
+        "Parameter": [
+            "Industry", "Target country", "Target currency", "Unlevered beta", "Levered beta",
+            "ERP", "Debt share", "D/E", "Project tax rate source", "Project tax rate",
+            "U.S. 10Y yield", f"{country} 10Y yield", "USD BBB spread",
+            f"{ccy} BBB spread (used)", f"{ccy} BBB spread (auto)", f"{ccy} spread overridden",
+        ],
+        "Value": [
+            industry, country, ccy, beta_u, res["beta_l"], erp, w_d, res["de"], tax_choice, T,
+            r_usd, r_fc, s_usd, res["s_fc"], res["s_fc_auto"], s_fc_manual is not None,
+        ],
+    }
+)
+results_df = summary.reset_index().rename(columns={"index": "Item"})
+sources_rows = []
+for key, label in (("betas", "Unlevered industry betas"), ("tax", "Corporate tax rates"),
+                   ("spread", "USD BBB spread"), ("yields", "10Y government yields")):
+    ok, m, err = status[key]
+    sources_rows.append({
+        "Data": label, "Status": "live" if ok else f"FAILED – placeholder ({err})",
+        "Source": m["url"], "As of": m["as_of"], "Fetched": m["fetched"], "Note": m.get("note", ""),
+    })
+sources_df = pd.DataFrame(sources_rows)
+
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    inputs_df.to_excel(xw, sheet_name="Inputs", index=False)
+    results_df.to_excel(xw, sheet_name="Results", index=False)
+    all_df.to_excel(xw, sheet_name="All industries", index=False)
+    sources_df.to_excel(xw, sheet_name="Sources", index=False)
+
+d1, d2, d3 = st.columns(3)
+d1.download_button("Download scenario (CSV)",
+                   pd.concat([inputs_df.astype(str), results_df.astype(str)], axis=0).to_csv(index=False),
+                   "cost_of_capital_scenario.csv", "text/csv")
+d2.download_button("Download all industries (CSV)", all_df.to_csv(index=False),
+                   "cost_of_capital_all_industries.csv", "text/csv")
+d3.download_button("Download full workbook (Excel)", buf.getvalue(), "cost_of_capital.xlsx",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# --------------------------------------------------------------------------- #
+# Sources and dates
+# --------------------------------------------------------------------------- #
+st.subheader("Data sources and dates")
+used = {
+    "betas": f"β_U = {beta_u_f:.4f} ({industry})",
+    "tax": f"U.S. {pct(us_tax_f)}" + (f"; {country} {pct(fc_tax_f)}" if fc_tax_f is not None else f"; {country} n/a"),
+    "spread": f"{pct(usd_spread_fetched, 3)}",
+    "yields": f"U.S. {pct(us_y_f, 3)} ({yld_norm.get('united states', ('', '', ''))[2]})"
+              + (f"; {country} {pct(fc_y_f, 3)} ({fc_y_entry[2]})" if fc_y_entry else f"; {country} n/a"),
+}
+src_show = sources_df.copy()
+src_show.insert(2, "Fetched value", [used[k] for k in ("betas", "tax", "spread", "yields")])
+st.dataframe(src_show, hide_index=True)
+
+overrides = [n for n, on in (("unlevered beta", ov_beta), ("U.S. tax", ov_ustax), (f"{country} tax", ov_fctax),
+                             ("USD spread", ov_susd), ("U.S. yield", ov_rusd), (f"{country} yield", ov_rfc),
+                             (f"{ccy} spread", s_fc_manual is not None)) if on]
+if overrides:
+    st.info("Manual overrides in use: " + ", ".join(overrides))
+
+with st.expander("All fetched 10Y yields"):
+    st.dataframe(yields_df.assign(**{"Yield (%)": yields_df["Yield"] * 100}).drop(columns="Yield"), hide_index=True)
+
+st.caption("Educational tool. Data © Aswath Damodaran (NYU Stern) and Trading Economics. Verify before use.")
