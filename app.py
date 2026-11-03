@@ -269,7 +269,7 @@ all_betas = sources.get("betas", (pd.DataFrame(), ""))[0]
 industries = all_betas["Industry"].tolist() if len(all_betas) else ["Software (System & Application)"]
 preferred = "Software (System & Application)"
 industry = st.sidebar.selectbox("U.S. industry", industries, index=industries.index(preferred) if preferred in industries else 0)
-country = st.sidebar.selectbox("Project country", list(COUNTRIES), index=0)
+country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)", list(COUNTRIES), index=0)
 currency, slug = COUNTRIES[country]
 
 industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered beta"]) if len(all_betas) and industry in all_betas["Industry"].values else None
@@ -279,22 +279,36 @@ beta_u = st.sidebar.number_input("Unlevered beta", min_value=0.0, max_value=10.0
 erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 40.0, 6.5, 0.25)
 debt_pct = st.sidebar.slider("Target debt financing (% of D+E)", 0, 95, 30)
 
-published_tax = sources.get("tax", {}).get("Korea" if country == "South Korea" else country)
+# Load both tax rates from the same country table. The United States is a
+# fixed baseline, not a selectable target-market replacement.
+tax_table = sources.get("tax", {})
+published_us_tax = tax_table.get("United States")
+published_target_tax = tax_table.get("Korea" if country == "South Korea" else country)
 published_spread = sources.get("spread")
+
+st.sidebar.markdown("### Tax jurisdiction for the project")
+st.sidebar.caption("Both currency WACCs must use one project tax rate; changing the valuation currency does not change where the project is taxed.")
+tax_jurisdiction = st.sidebar.radio(
+    "Project taxable in", ["Target country", "United States"],
+    index=0, horizontal=False,
+    help="This selects a single tax rate used in both USD and foreign-currency calculations."
+)
+tax_country = country if tax_jurisdiction == "Target country" else "United States"
+published_tax = published_target_tax if tax_jurisdiction == "Target country" else published_us_tax
 
 # Published Damodaran values are used automatically. Overrides only appear
 # when the user explicitly requests one, or when downloading fails.
 st.sidebar.markdown("### Published Damodaran inputs")
 if published_tax is not None:
-    st.sidebar.caption(f"{country} corporate tax rate: **{published_tax:.2f}%** (Damodaran)")
+    st.sidebar.caption(f"Project tax rate ({tax_country}): **{published_tax:.2f}%** (Damodaran)")
     tax_override = st.sidebar.checkbox("Override corporate tax rate", value=False, key="override_tax")
 else:
-    st.sidebar.warning(f"No published tax rate available for {country}; enter a value below.")
+    st.sidebar.warning(f"No published tax rate available for {tax_country}; enter a value below.")
     tax_override = True
 if tax_override:
     tax = st.sidebar.number_input("Project corporate tax rate (%)", 0.0, 100.0,
                                   value=float(published_tax) if published_tax is not None else 25.0,
-                                  step=0.5, key=f"manual_tax_{country}")
+                                  step=0.5, key=f"manual_tax_{tax_country}")
 else:
     tax = float(published_tax)
 
@@ -311,6 +325,8 @@ if spread_override:
 else:
     spread_us = float(published_spread)
 
+st.subheader("Country comparison: United States (fixed) vs. target")
+st.caption("The U.S. is always the original reference country. Selecting a target adds a comparison column; it never replaces the U.S. inputs.")
 st.subheader("Government bond yields • Trading Economics")
 st.caption("The 10-year government yield is used as a teaching proxy for each currency's base rate. Sovereign credit and inflation components are not separately removed.")
 # No paid API or API-key setup. Read public pages when possible; otherwise enter yields manually.
@@ -336,11 +352,11 @@ else:
     fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
 
 # Make the fetched data visible even when the user has not enabled an override.
-st.markdown("**Automatically retrieved Trading Economics quotes**")
+st.markdown("**Automatically retrieved Trading Economics quotes — U.S. and target, side by side**")
 quotes = [
-    {"Market": "United States 10Y", "Retrieved yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
+    {"Market": "Original: United States 10Y", "Retrieved yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
      "Observation date on source": us_source_date if us_value is not None else "Unavailable", "Source": us_source or "Manual required"},
-    {"Market": f"{country} 10Y", "Retrieved yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
+    {"Market": f"Target: {country} 10Y", "Retrieved yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
      "Observation date on source": fc_source_date if fc_value is not None else "Unavailable", "Source": fc_source or "Manual required"},
 ]
 st.dataframe(pd.DataFrame(quotes), hide_index=True, width="stretch")
@@ -389,15 +405,37 @@ values = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us,
                    spread_fc_override if spread_override_on else None)
 st.caption(f"Automatically converted BBB {currency} spread: **{values['spread_fc_auto']:.3f}%** | Effective: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic'})")
 
+# Present the published inputs for BOTH countries in one aligned table.
+# The tax observations are reference data; the model uses ONE project tax rate
+# in both WACC columns to isolate currency denomination, per assignment.
+st.subheader("Original U.S. vs. target: input audit")
+st.caption("Published tax rates are shown for BOTH jurisdictions, but the same selected project tax rate enters both calculations. U.S. industry beta and the ERP are also common to both currency calculations.")
+audit_rows = [
+    {"Input": "Currency", "United States (fixed)": "USD", f"Target: {country}": currency},
+    {"Input": "10Y sovereign yield (%)", "United States (fixed)": f"{rf_us:.4f}%", f"Target: {country}": f"{rf_foreign:.4f}%"},
+    {"Input": "Yield source", "United States (fixed)": "manual" if us_manual else (us_source or "unavailable"), f"Target: {country}": "manual" if fc_manual else (fc_source or "unavailable")},
+    {"Input": "Yield observation date", "United States (fixed)": us_date or "unverified", f"Target: {country}": fc_date or "unverified"},
+    {"Input": "Published corporate tax (%)", "United States (fixed)": f"{published_us_tax:.2f}%" if published_us_tax is not None else "unavailable", f"Target: {country}": f"{published_target_tax:.2f}%" if published_target_tax is not None else "unavailable"},
+    {"Input": "Tax actually used in BOTH WACCs (%)", "United States (fixed)": f"{tax:.2f}% ({tax_country})", f"Target: {country}": f"{tax:.2f}% ({tax_country})"},
+    {"Input": "Unlevered industry beta (U.S. industry dataset)", "United States (fixed)": f"{beta_u:.3f}", f"Target: {country}": f"{beta_u:.3f} (shared)"},
+    {"Input": "Levered project beta", "United States (fixed)": f"{values['beta_l']:.3f}", f"Target: {country}": f"{values['beta_l']:.3f} (shared)"},
+    {"Input": "Equity risk premium (%)", "United States (fixed)": f"{erp:.2f}%", f"Target: {country}": f"{erp:.2f}% (shared)"},
+    {"Input": "BBB borrowing spread (%)", "United States (fixed)": f"{spread_us:.3f}% (Damodaran / override)", f"Target: {country}": f"{values['spread_fc']:.3f}% ({'override' if spread_override_on else 'converted'})"},
+    {"Input": "Debt weight (%)", "United States (fixed)": f"{debt_pct:.0f}%", f"Target: {country}": f"{debt_pct:.0f}% (shared)"},
+    {"Input": "Equity weight (%)", "United States (fixed)": f"{100-debt_pct:.0f}%", f"Target: {country}": f"{100-debt_pct:.0f}% (shared)"},
+]
+st.dataframe(pd.DataFrame(audit_rows).set_index("Input"), width="stretch")
+st.caption("Damodaran source links and release context are listed at the bottom. Government yields are source-dated individually; 'unverified' is not a confirmed market observation date.")
+
 st.subheader("Side-by-side valuation inputs")
 left, right = st.columns(2)
-for pane, label, suffix in ((left, "USD", "us"), (right, currency, "fc")):
+for pane, label, suffix in ((left, "Original: United States (USD)", "us"), (right, f"Target: {country} ({currency})", "fc")):
     with pane:
         st.markdown(f"### {label}")
         st.metric("Cost of equity", f"{values[f'cost_e_{suffix}']:.2f}%")
         st.metric("Pre-tax cost of debt", f"{values[f'cost_d_{suffix}']:.2f}%")
         st.metric("WACC", f"{values[f'wacc_{suffix}']:.2f}%")
-st.caption(f"Levered beta: {values['beta_l']:.3f} | Debt weight: {debt_pct:.0f}% | Equity weight: {100-debt_pct:.0f}% | Project tax: {tax:.2f}%")
+st.caption(f"Levered beta (shared): {values['beta_l']:.3f} | Debt weight (shared): {debt_pct:.0f}% | Equity weight (shared): {100-debt_pct:.0f}% | Project tax in BOTH calculations: {tax:.2f}% ({tax_country})")
 
 with st.expander("Model equations and assumptions", expanded=True):
     st.latex(r"\beta_L=\beta_U\left[1+(1-T)\frac{D}{E}\right],\quad \frac{D}{E}=\frac{w_D}{1-w_D}")
@@ -426,14 +464,16 @@ else:
                        file_name="international_cost_of_capital_industries.csv", mime="text/csv")
 
 selected_row = pd.DataFrame([{
-    "industry": industry, "country": country, "currency": currency,
+    "industry": industry, "original_country": "United States", "country": country, "currency": currency,
+    "us_published_tax_pct": published_us_tax, "target_published_tax_pct": published_target_tax,
+    "project_tax_jurisdiction": tax_country,
     "unlevered_beta": beta_u, "levered_beta": values["beta_l"], "erp_pct": erp,
     "debt_weight": debt_weight, "tax_pct": tax, "us_10y_yield_pct": rf_us,
     "country_10y_yield_pct": rf_foreign, "us_bbb_spread_pct": spread_us,
     "fc_bbb_spread_pct": values["spread_fc"], "fc_bbb_spread_override": spread_override_on,
     "us_cost_equity_pct": values["cost_e_us"], "us_cost_debt_pct": values["cost_d_us"],
     "us_yield_source": "manual" if us_manual else us_source, "us_observation_date": us_date,
-    "tax_source": "manual override" if tax_override else "Damodaran",
+    "tax_source": "manual override" if tax_override else f"Damodaran ({tax_country})",
     "us_bbb_spread_source": "manual override" if spread_override else "Damodaran",
     "fc_yield_source": "manual" if fc_manual else fc_source, "fc_observation_date": fc_date,
     "us_wacc_pct": values["wacc_us"], "fc_cost_equity_pct": values["cost_e_fc"],
@@ -443,7 +483,7 @@ st.download_button("Download current project result (CSV)", selected_row.to_csv(
                    file_name="international_cost_of_capital_project.csv", mime="text/csv")
 
 st.subheader("Data sources and provenance")
-st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — source and date shown above for API/public HTML; manual input otherwise")
+st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — source and date shown above for public HTML; manual input otherwise")
 st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
 if "betas" not in sources or tax_override or spread_override or us_manual or fc_manual:
     st.info("At least one figure is manually specified or an example fallback. Confirm source links and observation dates before submitting financial conclusions.")
