@@ -35,6 +35,14 @@ st.title("🌐 International Cost of Capital")
 st.caption("A transparent, currency-consistent cost-of-capital calculator • rates and spreads are annual percentages")
 
 
+with st.expander("Model equations and assumptions", expanded=True):
+    st.latex(r"\beta_L=\beta_U\left[1+(1-T)\frac{D}{E}\right],\quad \frac{D}{E}=\frac{w_D}{1-w_D}")
+    st.latex(r"k_{E,c}=r_{10Y,c}+\beta_L\,ERP")
+    st.latex(r"s_{FC}^{auto}=s_{USD}\frac{1+r_{10Y,FC}}{1+r_{10Y,USD}}\quad\text{(rates in decimals)}")
+    st.latex(r"k_{D,c}=r_{10Y,c}+s_c,\qquad WACC_c=(1-w_D)k_{E,c}+w_Dk_{D,c}(1-T)")
+    st.markdown("**Interpretation:** All rates use the same project beta, ERP, tax rate and debt/equity weights. We proxy each currency's base rate with its 10-year sovereign yield. The automatic spread rule is an *explicit modeling convention* that preserves the USD debt premium after a gross-rate currency translation; it is not an observed local-currency BBB credit spread. Local sovereign risk, currency hedging costs, country risk premia, and cross-currency basis are **not** separately modeled. A different formula supplied in class should supersede this illustrative convention.")
+
+
 def get_page(url: str) -> str:
     response = requests.get(url, timeout=18, headers={"User-Agent": "Mozilla/5.0 (education; financial-data exercise)"})
     response.raise_for_status()
@@ -263,7 +271,7 @@ with st.spinner("Reading published data..."):
     sources, errors = get_damodaran()
 
 if errors:
-    st.warning("Some Damodaran inputs are unavailable; use the manual inputs below. " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+    st.sidebar.warning("Some Damodaran inputs are unavailable; use the manual inputs below. " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
 
 all_betas = sources.get("betas", (pd.DataFrame(), ""))[0]
 industries = all_betas["Industry"].tolist() if len(all_betas) else ["Software (System & Application)"]
@@ -340,15 +348,13 @@ if spread_override:
 else:
     spread_us = float(published_spread)
 
-st.subheader("Country comparison: United States (fixed) vs. target")
-st.caption("The U.S. is always the original reference country. Selecting a target adds a comparison column; it never replaces the U.S. inputs.")
-st.subheader("Government bond yields • Trading Economics")
-st.caption("The 10-year government yield is used as a teaching proxy for each currency's base rate. Sovereign credit and inflation components are not separately removed.")
-# No paid API or API-key setup. Read public pages when possible; otherwise enter yields manually.
-use_public = st.checkbox(
+# Market parameter controls live in the sidebar; the main content starts at Input Audit.
+st.sidebar.markdown("### Government bond yields • Trading Economics")
+st.sidebar.caption("Public webpage retrieval is best effort. U.S. is the fixed original country; selected country is the target.")
+use_public = st.sidebar.checkbox(
     "Automatically read Trading Economics public pages (best effort)",
     value=True,
-    help="Public HTML format may change, automated access may be restricted, and website terms apply."
+    help="Public HTML may change or restrict automated access. No API key is required."
 )
 
 def resolve_yield(country_name: str, country_slug: str):
@@ -366,64 +372,69 @@ if country == "United States":
 else:
     fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
 
-# Make the fetched data visible even when the user has not enabled an override.
-st.markdown("**Automatically retrieved Trading Economics quotes — U.S. and target, side by side**")
+# Always show what was actually fetched, with its observation date (or explicit unknown).
+st.sidebar.markdown("**Retrieved 10Y quotes and source dates**")
 quotes = [
-    {"Market": "Original: United States 10Y", "Retrieved yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
-     "Observation date on source": us_source_date if us_value is not None else "Unavailable", "Source": us_source or "Manual required"},
-    {"Market": f"Target: {country} 10Y", "Retrieved yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
-     "Observation date on source": fc_source_date if fc_value is not None else "Unavailable", "Source": fc_source or "Manual required"},
+    {"Market": "United States", "Yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
+     "Observation date": us_source_date if us_value is not None else "Unavailable"},
+    {"Market": country, "Yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
+     "Observation date": fc_source_date if fc_value is not None else "Unavailable"},
 ]
-st.dataframe(pd.DataFrame(quotes), hide_index=True, width="stretch")
-st.caption("These are the retrieved values, not necessarily the values used if manual override is enabled. An unverified observation date is not the retrieval date. Refresh external data to request a new snapshot.")
-
+st.sidebar.dataframe(pd.DataFrame(quotes), hide_index=True, width="stretch")
+st.sidebar.caption("Observation dates are from the source page when verified, not the time this app fetched the page.")
 if us_error or fc_error:
-    st.warning("Automatic government yield retrieval incomplete. Enter and verify missing values manually. "
-               + "; ".join(f"{name}: {err}" for name, err in (("US", us_error), (country, fc_error)) if err))
+    st.sidebar.warning("Automatic government yields unavailable: " + "; ".join(
+        f"{name}: {err}" for name, err in (("US", us_error), (country, fc_error)) if err))
 
-col1, col2 = st.columns(2)
-with col1:
-    us_manual = st.checkbox("Override U.S. government yield manually", value=us_value is None,
-                            key="us_manual", disabled=us_value is None)
-    if us_value is None:
-        us_manual = True
-    rf_us = st.number_input("U.S. 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                            value=float(us_value if us_value is not None else 4.0), step=0.1,
-                            disabled=not us_manual, key="us_yield") if us_manual else float(us_value)
-    us_date = st.text_input("U.S. observation date (manual)", value="not provided", key="us_date") if us_manual else us_source_date
-    st.caption(f"Source: {'manual / illustrative initial value' if us_manual else us_source}; date: {us_date}")
-    st.markdown("[U.S. 10Y source](https://tradingeconomics.com/united-states/government-bond-yield)")
-with col2:
-    fc_manual = st.checkbox("Override selected-country yield manually", value=fc_value is None,
-                            key=f"fc_manual_{country}", disabled=fc_value is None)
-    if fc_value is None:
-        fc_manual = True
-    fc_default = fc_value if fc_value is not None else (rf_us if country == "United States" else 3.0)
-    rf_foreign = st.number_input(f"{country} 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                                 value=float(fc_default), step=0.1, disabled=not fc_manual,
-                                 key=f"fc_yield_{country}") if fc_manual else float(fc_value)
-    fc_date = st.text_input("Country observation date (manual)", value="not provided", key=f"fc_date_{country}") if fc_manual else fc_source_date
-    st.caption(f"Source: {'manual / illustrative initial value' if fc_manual else fc_source}; date: {fc_date}")
-    st.markdown(f"[{country} 10Y source](https://tradingeconomics.com/{slug}/government-bond-yield)")
+st.sidebar.markdown("**United States 10Y (original)**")
+us_manual = st.sidebar.checkbox("Override U.S. yield", value=us_value is None,
+                                key="us_manual", disabled=us_value is None)
+if us_value is None:
+    us_manual = True
+rf_us = (st.sidebar.number_input("U.S. 10-year yield (%)", min_value=-20.0, max_value=100.0,
+                                 value=float(us_value if us_value is not None else 4.0), step=0.1,
+                                 key="us_yield") if us_manual else float(us_value))
+us_date = (st.sidebar.text_input("U.S. observation date (manual)", value="not provided", key="us_date")
+           if us_manual else us_source_date)
+st.sidebar.caption(f"Used: {rf_us:.4f}% | {'manual' if us_manual else 'public page'} | date: {us_date}")
+st.sidebar.markdown("[U.S. 10Y source](https://tradingeconomics.com/united-states/government-bond-yield)")
+
+st.sidebar.markdown(f"**{country} 10Y (target)**")
+fc_manual = st.sidebar.checkbox("Override target yield", value=fc_value is None,
+                                key=f"fc_manual_{country}", disabled=fc_value is None)
+if fc_value is None:
+    fc_manual = True
+fc_default = fc_value if fc_value is not None else (rf_us if country == "United States" else 3.0)
+rf_foreign = (st.sidebar.number_input(f"{country} 10-year yield (%)", min_value=-20.0, max_value=100.0,
+                                       value=float(fc_default), step=0.1,
+                                       key=f"fc_yield_{country}") if fc_manual else float(fc_value))
+fc_date = (st.sidebar.text_input("Target observation date (manual)", value="not provided",
+                                 key=f"fc_date_{country}") if fc_manual else fc_source_date)
+st.sidebar.caption(f"Used: {rf_foreign:.4f}% | {'manual' if fc_manual else 'public page'} | date: {fc_date}")
+st.sidebar.markdown(f"[{country} 10Y source](https://tradingeconomics.com/{slug}/government-bond-yield)")
 
 if country == "United States" and abs(rf_us - rf_foreign) > 1e-8:
-    st.warning("Both columns represent USD, but their base yields differ. Set both U.S. and selected-country yields equal for currency consistency.")
+    st.sidebar.warning("Both columns use USD; set both government yields equal for currency consistency.")
 
 debt_weight = debt_pct / 100
 base = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us)
-st.subheader("Foreign-currency borrowing spread")
-spread_override_on = st.checkbox("Override the converted foreign-currency spread", value=False)
-spread_fc_override = st.number_input(f"Manual BBB spread in {currency} (%)", min_value=0.0, max_value=30.0,
-                                     value=float(base["spread_fc_auto"]), step=0.05,
-                                     disabled=not spread_override_on)
+st.sidebar.markdown("### Foreign-currency borrowing spread")
+st.sidebar.caption(f"Automatic BBB {currency} spread: **{base['spread_fc_auto']:.3f}%**")
+spread_override_on = st.sidebar.checkbox("Override converted foreign-currency spread", value=False)
+if spread_override_on:
+    spread_fc_override = st.sidebar.number_input(
+        f"Manual BBB spread in {currency} (%)", min_value=0.0, max_value=30.0,
+        value=float(base["spread_fc_auto"]), step=0.05)
+else:
+    spread_fc_override = None
 values = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us,
-                   spread_fc_override if spread_override_on else None)
-st.caption(f"Automatically converted BBB {currency} spread: **{values['spread_fc_auto']:.3f}%** | Effective: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic'})")
+                   spread_fc_override)
+st.sidebar.caption(f"Used: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic conversion'})")
 
 # Present the published inputs for BOTH countries in one aligned table.
 # The tax observations are reference data; the model uses ONE project tax rate
 # in both WACC columns to isolate currency denomination, per assignment.
-st.subheader("Original U.S. vs. target: input audit")
+st.subheader("Input audit: United States (fixed) vs. target")
 st.caption("Published tax rates are shown for BOTH jurisdictions, but the same selected project tax rate enters both calculations. U.S. industry beta and the ERP are also common to both currency calculations.")
 audit_rows = [
     {"Input": "Currency", "United States (fixed)": "USD", f"Target: {country}": currency},
@@ -452,12 +463,6 @@ for pane, label, suffix in ((left, "Original: United States (USD)", "us"), (righ
         st.metric("WACC", f"{values[f'wacc_{suffix}']:.2f}%")
 st.caption(f"Levered beta (shared): {values['beta_l']:.3f} | Debt weight (shared): {debt_pct:.0f}% | Equity weight (shared): {100-debt_pct:.0f}% | Project tax in BOTH calculations: {tax:.2f}% ({tax_country})")
 
-with st.expander("Model equations and assumptions", expanded=True):
-    st.latex(r"\beta_L=\beta_U\left[1+(1-T)\frac{D}{E}\right],\quad \frac{D}{E}=\frac{w_D}{1-w_D}")
-    st.latex(r"k_{E,c}=r_{10Y,c}+\beta_L\,ERP")
-    st.latex(r"s_{FC}^{auto}=s_{USD}\frac{1+r_{10Y,FC}}{1+r_{10Y,USD}}\quad\text{(rates in decimals)}")
-    st.latex(r"k_{D,c}=r_{10Y,c}+s_c,\qquad WACC_c=(1-w_D)k_{E,c}+w_Dk_{D,c}(1-T)")
-    st.markdown("**Interpretation:** All rates use the same project beta, ERP, tax rate and debt/equity weights. We proxy each currency's base rate with its 10-year sovereign yield. The automatic spread rule is an *explicit modeling convention* that preserves the USD debt premium after a gross-rate currency translation; it is not an observed local-currency BBB credit spread. Local sovereign risk, currency hedging costs, country risk premia, and cross-currency basis are **not** separately modeled. A different formula supplied in class should supersede this illustrative convention.")
 
 st.subheader("All-industry comparison")
 if all_betas.empty:
