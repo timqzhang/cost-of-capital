@@ -261,7 +261,7 @@ def get_damodaran():
     return results, errors
 
 
-st.sidebar.header("Project assumptions")
+st.sidebar.header("Parameters & overrides")
 refresh = st.sidebar.button("↻ Refresh external data", help="Clears cached Damodaran inputs and reloads the Trading Economics snapshot")
 if refresh:
     get_damodaran.clear()
@@ -276,6 +276,7 @@ if errors:
 all_betas = sources.get("betas", (pd.DataFrame(), ""))[0]
 industries = all_betas["Industry"].tolist() if len(all_betas) else ["Software (System & Application)"]
 preferred = "Software (System & Application)"
+st.sidebar.markdown("### Project selection")
 industry = st.sidebar.selectbox("U.S. industry", industries, index=industries.index(preferred) if preferred in industries else 0)
 country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)", list(COUNTRIES), index=0)
 currency, slug = COUNTRIES[country]
@@ -283,9 +284,9 @@ currency, slug = COUNTRIES[country]
 industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered beta"]) if len(all_betas) and industry in all_betas["Industry"].values else None
 # Like published tax and BBB spread, the industry beta defaults to the
 # Damodaran value. Manual editing is explicitly opt-in (or a data fallback).
-st.sidebar.markdown("### Industry beta • Damodaran")
+st.sidebar.markdown("### Unlevered beta")
 if industry_beta is not None:
-    st.sidebar.caption(f"{industry} unlevered beta: **{industry_beta:.3f}** (Damodaran)")
+    st.sidebar.markdown(f"**{industry_beta:.3f}** · Damodaran industry beta")
     beta_override = st.sidebar.checkbox("Override unlevered beta", value=False, key="override_beta")
 else:
     st.sidebar.warning("Published unlevered beta unavailable; enter a value below.")
@@ -299,8 +300,11 @@ if beta_override:
     )
 else:
     beta_u = float(industry_beta)
-erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 40.0, 6.5, 0.25)
-debt_pct = st.sidebar.slider("Target debt financing (% of D+E)", 0, 95, 30)
+st.sidebar.markdown("### Equity risk premium")
+erp = st.sidebar.number_input("ERP (%)", 0.0, 40.0, 6.5, 0.25)
+st.sidebar.markdown("### Financing ratio")
+debt_pct = st.sidebar.slider("Debt share of total capital (%)", 0, 95, 30)
+st.sidebar.caption(f"Debt: {debt_pct}% · Equity: {100-debt_pct}% · D/E: {debt_pct / (100-debt_pct):.3f}")
 
 # Load both tax rates from the same country table. The United States is a
 # fixed baseline, not a selectable target-market replacement.
@@ -309,8 +313,8 @@ published_us_tax = tax_table.get("United States")
 published_target_tax = tax_table.get("Korea" if country == "South Korea" else country)
 published_spread = sources.get("spread")
 
-st.sidebar.markdown("### Tax jurisdiction for the project")
-st.sidebar.caption("Both currency WACCs must use one project tax rate; changing the valuation currency does not change where the project is taxed.")
+st.sidebar.markdown("### Project tax rate")
+st.sidebar.caption("One project tax rate applies to both currencies.")
 tax_jurisdiction = st.sidebar.radio(
     "Project taxable in", ["Target country", "United States"],
     index=0, horizontal=False,
@@ -321,9 +325,8 @@ published_tax = published_target_tax if tax_jurisdiction == "Target country" els
 
 # Published Damodaran values are used automatically. Overrides only appear
 # when the user explicitly requests one, or when downloading fails.
-st.sidebar.markdown("### Published Damodaran inputs")
 if published_tax is not None:
-    st.sidebar.caption(f"Project tax rate ({tax_country}): **{published_tax:.2f}%** (Damodaran)")
+    st.sidebar.markdown(f"**{published_tax:.2f}%** · {tax_country} (Damodaran)")
     tax_override = st.sidebar.checkbox("Override corporate tax rate", value=False, key="override_tax")
 else:
     st.sidebar.warning(f"No published tax rate available for {tax_country}; enter a value below.")
@@ -335,8 +338,9 @@ if tax_override:
 else:
     tax = float(published_tax)
 
+st.sidebar.markdown("### USD BBB spread")
 if published_spread is not None:
-    st.sidebar.caption(f"BBB USD borrowing spread: **{published_spread:.3f}%** (Damodaran)")
+    st.sidebar.markdown(f"**{published_spread:.3f}%** · Damodaran")
     spread_override = st.sidebar.checkbox("Override USD BBB spread", value=False, key="override_us_spread")
 else:
     st.sidebar.warning("Published BBB USD spread unavailable; enter a value below.")
@@ -348,23 +352,16 @@ if spread_override:
 else:
     spread_us = float(published_spread)
 
-# Market parameter controls live in the sidebar; the main content starts at Input Audit.
-st.sidebar.markdown("### Government bond yields • Trading Economics")
-st.sidebar.caption("Public webpage retrieval is best effort. U.S. is the fixed original country; selected country is the target.")
-use_public = st.sidebar.checkbox(
-    "Automatically read Trading Economics public pages (best effort)",
-    value=True,
-    help="Public HTML may change or restrict automated access. No API key is required."
-)
+# Yield inputs: concise sidebar display. Source details remain in the Input Audit.
+st.sidebar.markdown("### 10-year government yields")
+use_public = True  # Public-page retrieval is always attempted; no API key.
 
 def resolve_yield(country_name: str, country_slug: str):
-    if use_public:
-        try:
-            val, date = load_te_public_yield(country_slug, country_name)
-            return val, date, "Trading Economics public page", None
-        except Exception as e:
-            return None, None, None, str(e)
-    return None, None, None, "Public-page retrieval disabled"
+    try:
+        val, date = load_te_public_yield(country_slug, country_name)
+        return val, date, "Trading Economics public page", None
+    except Exception as exc:
+        return None, None, None, str(exc)
 
 us_value, us_source_date, us_source, us_error = resolve_yield("United States", "united-states")
 if country == "United States":
@@ -372,53 +369,50 @@ if country == "United States":
 else:
     fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
 
-# Always show what was actually fetched, with its observation date (or explicit unknown).
-st.sidebar.markdown("**Retrieved 10Y quotes and source dates**")
-quotes = [
-    {"Market": "United States", "Yield": f"{us_value:.4f}%" if us_value is not None else "Unavailable",
-     "Observation date": us_source_date if us_value is not None else "Unavailable"},
-    {"Market": country, "Yield": f"{fc_value:.4f}%" if fc_value is not None else "Unavailable",
-     "Observation date": fc_source_date if fc_value is not None else "Unavailable"},
-]
-st.sidebar.dataframe(pd.DataFrame(quotes), hide_index=True, width="stretch")
-st.sidebar.caption("Observation dates are from the source page when verified, not the time this app fetched the page.")
+# Show the retrieved value and its observation date before optional editing.
+def yield_control(label: str, quote: float | None, source_date: str | None,
+                  override_key: str, value_key: str, date_key: str,
+                  fallback: float) -> tuple[float, str, bool]:
+    st.sidebar.markdown(f"**{label}**")
+    if quote is not None:
+        st.sidebar.caption(f"Trading Economics: **{quote:.4f}%** · Date: {source_date or 'unverified'}")
+        manual = st.sidebar.checkbox(f"Override {label} yield", value=False, key=override_key)
+    else:
+        st.sidebar.caption("Trading Economics: **Unavailable** · Date: unavailable")
+        st.sidebar.warning("Automatic retrieval failed; manual entry required.")
+        manual = True
+    if manual:
+        val = st.sidebar.number_input(
+            f"{label} yield (%)", min_value=-20.0, max_value=100.0,
+            value=float(quote if quote is not None else fallback), step=0.1,
+            key=value_key,
+        )
+        date = st.sidebar.text_input(f"{label} observation date", value="not provided", key=date_key)
+    else:
+        val, date = float(quote), source_date or "unverified"
+    return float(val), date, manual
+
+rf_us, us_date, us_manual = yield_control(
+    "United States", us_value, us_source_date, "us_manual", "us_yield", "us_date", 4.0
+)
+rf_foreign, fc_date, fc_manual = yield_control(
+    country, fc_value, fc_source_date, f"fc_manual_{country}",
+    f"fc_yield_{country}", f"fc_date_{country}",
+    rf_us if country == "United States" else 3.0,
+)
+# Technical failure reasons belong in a collapsible diagnostic, not the main form.
 if us_error or fc_error:
-    st.sidebar.warning("Automatic government yields unavailable: " + "; ".join(
-        f"{name}: {err}" for name, err in (("US", us_error), (country, fc_error)) if err))
-
-st.sidebar.markdown("**United States 10Y (original)**")
-us_manual = st.sidebar.checkbox("Override U.S. yield", value=us_value is None,
-                                key="us_manual", disabled=us_value is None)
-if us_value is None:
-    us_manual = True
-rf_us = (st.sidebar.number_input("U.S. 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                                 value=float(us_value if us_value is not None else 4.0), step=0.1,
-                                 key="us_yield") if us_manual else float(us_value))
-us_date = (st.sidebar.text_input("U.S. observation date (manual)", value="not provided", key="us_date")
-           if us_manual else us_source_date)
-st.sidebar.caption(f"Used: {rf_us:.4f}% | {'manual' if us_manual else 'public page'} | date: {us_date}")
-st.sidebar.markdown("[U.S. 10Y source](https://tradingeconomics.com/united-states/government-bond-yield)")
-
-st.sidebar.markdown(f"**{country} 10Y (target)**")
-fc_manual = st.sidebar.checkbox("Override target yield", value=fc_value is None,
-                                key=f"fc_manual_{country}", disabled=fc_value is None)
-if fc_value is None:
-    fc_manual = True
-fc_default = fc_value if fc_value is not None else (rf_us if country == "United States" else 3.0)
-rf_foreign = (st.sidebar.number_input(f"{country} 10-year yield (%)", min_value=-20.0, max_value=100.0,
-                                       value=float(fc_default), step=0.1,
-                                       key=f"fc_yield_{country}") if fc_manual else float(fc_value))
-fc_date = (st.sidebar.text_input("Target observation date (manual)", value="not provided",
-                                 key=f"fc_date_{country}") if fc_manual else fc_source_date)
-st.sidebar.caption(f"Used: {rf_foreign:.4f}% | {'manual' if fc_manual else 'public page'} | date: {fc_date}")
-st.sidebar.markdown(f"[{country} 10Y source](https://tradingeconomics.com/{slug}/government-bond-yield)")
+    with st.sidebar.expander("Yield retrieval details"):
+        for name, err in (("United States", us_error), (country, fc_error)):
+            if err:
+                st.caption(f"{name}: {err}")
 
 if country == "United States" and abs(rf_us - rf_foreign) > 1e-8:
     st.sidebar.warning("Both columns use USD; set both government yields equal for currency consistency.")
 
 debt_weight = debt_pct / 100
 base = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us)
-st.sidebar.markdown("### Foreign-currency borrowing spread")
+st.sidebar.markdown("### Target-currency BBB spread")
 st.sidebar.caption(f"Automatic BBB {currency} spread: **{base['spread_fc_auto']:.3f}%**")
 spread_override_on = st.sidebar.checkbox("Override converted foreign-currency spread", value=False)
 if spread_override_on:
