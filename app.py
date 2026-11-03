@@ -273,9 +273,24 @@ country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)", list(C
 currency, slug = COUNTRIES[country]
 
 industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered beta"]) if len(all_betas) and industry in all_betas["Industry"].values else None
-beta_u = st.sidebar.number_input("Unlevered beta", min_value=0.0, max_value=10.0,
-                                  value=industry_beta if industry_beta is not None else 1.00,
-                                  step=0.05, format="%.3f", key=f"beta_{industry}", help="Editable; initially populated from Damodaran when available.")
+# Like published tax and BBB spread, the industry beta defaults to the
+# Damodaran value. Manual editing is explicitly opt-in (or a data fallback).
+st.sidebar.markdown("### Industry beta • Damodaran")
+if industry_beta is not None:
+    st.sidebar.caption(f"{industry} unlevered beta: **{industry_beta:.3f}** (Damodaran)")
+    beta_override = st.sidebar.checkbox("Override unlevered beta", value=False, key="override_beta")
+else:
+    st.sidebar.warning("Published unlevered beta unavailable; enter a value below.")
+    beta_override = True
+if beta_override:
+    beta_u = st.sidebar.number_input(
+        "Project unlevered beta", min_value=0.0, max_value=10.0,
+        value=float(industry_beta) if industry_beta is not None else 1.0,
+        step=0.05, format="%.3f", key=f"manual_beta_{industry}",
+        help="Use a manual beta only for a deliberate override or when Damodaran data is unavailable."
+    )
+else:
+    beta_u = float(industry_beta)
 erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 40.0, 6.5, 0.25)
 debt_pct = st.sidebar.slider("Target debt financing (% of D+E)", 0, 95, 30)
 
