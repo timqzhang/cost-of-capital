@@ -417,8 +417,7 @@ tax_table = sources.get("tax", {})
 # on /bonds (never inferred URLs), with manually entered yields.
 te_available = list(te_quotes) if te_quotes else list(COUNTRY_CURRENCIES)
 country_options = sorted(c for c in te_available
-                         if c != "United States" and
-                         (tax_lookup(tax_table, c) is not None or not tax_table))
+                         if tax_lookup(tax_table, c) is not None or not tax_table)
 if not country_options:
     st.error("No countries can be matched between the tax and 10Y datasets. Refresh the data.")
     st.stop()
