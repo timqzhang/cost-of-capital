@@ -712,6 +712,10 @@ for name, bu in zip(betas_df["Industry"], betas_df["Unlevered beta"]):
         "Levered beta": rr["beta_l"],
         "Cost of equity USD (%)": rr["USD"]["ke"] * 100,
         f"Cost of equity {ccy} (%)": rr["FC"]["ke"] * 100,
+        "Pre-tax cost of debt USD (%)": rr["USD"]["kd"] * 100,
+        f"Pre-tax cost of debt {ccy} (%)": rr["FC"]["kd"] * 100,
+        "After-tax cost of debt USD (%)": rr["USD"]["kd_after"] * 100,
+        f"After-tax cost of debt {ccy} (%)": rr["FC"]["kd_after"] * 100,
         "WACC USD (%)": rr["USD"]["wacc"] * 100,
         f"WACC {ccy} (%)": rr["FC"]["wacc"] * 100,
     })
