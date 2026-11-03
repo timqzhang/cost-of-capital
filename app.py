@@ -247,62 +247,87 @@ def load_bbb_spread() -> float:
 
 
 def parse_te_bonds_table(html: str) -> dict[str, tuple[float, str]]:
-    """Read named 10Y yields from the public /bonds table, if present in HTML.
+    """Read 10-year government yields from Trading Economics' /bonds tables.
 
-    Trading Economics may change markup or render table rows client-side.
-    Do not treat a blocked/empty response as an actual absence of bond data.
+    The real page has multi-row region headings (Major10Y, Europe, etc.),
+    extra blank/flag cells, and sometimes a Date column that is not in the
+    first HTML header row. Country cells may therefore not occupy column 0.
     """
     soup = BeautifulSoup(html, "html.parser")
     output: dict[str, tuple[float, str]] = {}
-    checked_headers = []
+    debug_rows = []
 
     def clean(value: str) -> str:
         return re.sub(r"\s+", " ", value).strip()
 
-    for table in soup.find_all("table"):
-        # Some versions put the column labels in a THEAD or in a later TR.
-        rows = table.find_all("tr")
-        header_row, yield_col, date_col = None, None, None
-        for idx, tr in enumerate(rows[:8]):
-            labels = [clean(c.get_text(" ", strip=True)).casefold()
-                      for c in tr.find_all(["th", "td"], recursive=False)]
-            if labels:
-                checked_headers.append(labels[:6])
-            # e.g. Major10Y / Yield / Chg / Monthly / Date
-            if "yield" in labels and "date" in labels:
-                header_row = idx
-                yield_col, date_col = labels.index("yield"), labels.index("date")
-                break
-        if header_row is None:
-            continue
+    # Do not infer an unavailable year from an abbreviated date.
+    date_pattern = re.compile(
+        r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"/\d{1,2}(?:/\d{2,4})?$", re.I
+    )
+    numeric_pattern = re.compile(r"^-?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?$")
+    supported = {name.casefold(): name for name in COUNTRY_CURRENCIES}
 
-        for tr in rows[header_row + 1:]:
-            cells = [clean(c.get_text(" ", strip=True))
-                     for c in tr.find_all(["th", "td"], recursive=False)]
-            if len(cells) <= max(yield_col, date_col):
+    for table in soup.find_all("table"):
+        header_yield_col = None
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["td", "th"], recursive=False)
+            if not cells:
                 continue
-            country = cells[0]
-            if country not in COUNTRY_CURRENCIES:
+            values = [clean(c.get_text(" ", strip=True)) for c in cells]
+            if len(debug_rows) < 8:
+                debug_rows.append(values[:10])
+            lower = [v.casefold() for v in values]
+            if "yield" in lower and any(
+                x in lower for x in ("major10y", "europe", "america", "asia", "africa", "oceania")
+            ):
+                header_yield_col = lower.index("yield")
                 continue
-            try:
-                value = float(cells[yield_col].replace(",", "").replace("%", ""))
-            except ValueError:
+
+            # Locate the country in *any* cell, not just the first. TE often
+            # has a leading blank cell containing a flag / sorting marker.
+            country_col = None
+            for idx, value in enumerate(values):
+                if value.casefold() in supported:
+                    country_col = idx
+                    break
+            if country_col is None:
                 continue
-            if not (-20 <= value <= 100):
+            country = supported[values[country_col].casefold()]
+
+            # The yield is normally the first numeric field after country;
+            # prefer the named header position when it aligns with the row.
+            candidates = list(range(country_col + 1, min(len(values), country_col + 5)))
+            if header_yield_col is not None:
+                candidates.append(header_yield_col)
+            quote = None
+            for idx in dict.fromkeys(candidates):
+                if idx <= country_col or idx >= len(values):
+                    continue
+                token = values[idx].replace("%", "").replace(",", "")
+                if not numeric_pattern.fullmatch(values[idx]):
+                    continue
+                try:
+                    parsed = float(token)
+                except ValueError:
+                    continue
+                if -20 <= parsed <= 100:
+                    quote = parsed
+                    break
+            if quote is None:
                 continue
-            source_date = cells[date_col] or "Not available"
-            if re.fullmatch(r"[A-Za-z]{3}/\d{1,2}", source_date):
-                source_date += " (year not shown)"
-            output.setdefault(country, (value, source_date))
+
+            dates = [v for v in values if date_pattern.fullmatch(v)]
+            observation_date = dates[-1] + " (year not shown)" if dates else "Not available"
+            output.setdefault(country, (quote, observation_date))
 
     if "United States" not in output or len(output) < 12:
         title = soup.title.get_text(" ", strip=True) if soup.title else "No HTML title"
         raise ValueError(
             f"Bonds table parse failed: {len(output)} recognized countries; "
             f"{len(soup.find_all('table'))} HTML tables; title={title[:90]!r}; "
-            f"first table headers={checked_headers[:3]!r}. "
-            "The webpage may be rendered with JavaScript or may return "
-            "a different page to Streamlit Cloud."
+            f"sample HTML rows={debug_rows[:5]!r}. "
+            "HTML may have an unexpected row/cell structure."
         )
     return output
 
@@ -360,51 +385,7 @@ def get_damodaran():
     return results, errors
 
 
-def diagnostic_te_connection():
-    """Uncached HTTP diagnostic executed on the Streamlit Cloud host."""
-    from time import perf_counter
-    url = TE_BONDS_URL
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    started = perf_counter()
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        st.write("HTTP status:", response.status_code)
-        st.write("Final URL:", response.url)
-        st.write("Elapsed seconds:", round(perf_counter() - started, 2))
-        st.write("Content-Type:", response.headers.get("content-type", "missing"))
-        st.write("Response size (bytes):", len(response.content))
-        st.write("Server date header:", response.headers.get("date", "missing"))
-        response.raise_for_status()
-        html = response.text
-        soup = BeautifulSoup(html, "html.parser")
-        st.write("HTML page title:", soup.title.get_text(" ", strip=True) if soup.title else "missing")
-        st.write("Number of HTML tables:", len(soup.find_all("table")))
-        st.write("Contains United States text:", "United States" in html)
-        st.write("Contains Japan text:", "Japan" in html)
-        try:
-            quotes = parse_te_bonds_table(html)
-            st.success(f"Parser succeeded: {len(quotes)} countries")
-            for sample in ("United States", "Japan", "Germany", "Brazil", "China", "Austria"):
-                st.write(f"{sample}: {quotes.get(sample, 'NOT FOUND')}")
-        except Exception as parse_exc:
-            st.error(f"Parser failure: {type(parse_exc).__name__}: {parse_exc}")
-        st.caption("HTML response preview (first 800 characters):")
-        st.code(html[:800], language="html")
-    except requests.exceptions.RequestException as exc:
-        st.error(f"HTTP / connection failure: {type(exc).__name__}: {exc}")
-    except Exception as exc:
-        st.error(f"Unexpected diagnostic failure: {type(exc).__name__}: {exc}")
-
-
 st.sidebar.header("Parameters & overrides")
-with st.sidebar.expander("Trading Economics connection test", expanded=False):
-    st.caption("Tests the live request from THIS Streamlit Cloud server (does not use cache).")
-    if st.button("Run HTTP diagnostic", key="te_http_diagnostic"):
-        diagnostic_te_connection()
 refresh = st.sidebar.button("↻ Refresh external data", help="Clears cached Damodaran inputs and reloads the Trading Economics snapshot")
 if refresh:
     get_damodaran.clear()
@@ -562,7 +543,7 @@ rf_foreign, fc_date, fc_manual = yield_control(
     f"fc_yield_{country}", f"fc_date_{country}",
     rf_us if country == "United States" else 3.0,
 )
-# Technical failure reasons belong in a collapsible diagnostic, not the main form.
+# Technical retrieval errors are shown only if automatic input fails.
 if us_error or fc_error:
     with st.sidebar.expander("Yield retrieval details"):
         for name, err in (("United States", us_error), (country, fc_error)):
