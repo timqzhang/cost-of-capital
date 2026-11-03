@@ -43,10 +43,46 @@ with st.expander("Model equations and assumptions", expanded=True):
     st.markdown("**Interpretation:** All rates use the same project beta, ERP, tax rate and debt/equity weights. We proxy each currency's base rate with its 10-year sovereign yield. The automatic spread rule is an *explicit modeling convention* that preserves the USD debt premium after a gross-rate currency translation; it is not an observed local-currency BBB credit spread. Local sovereign risk, currency hedging costs, country risk premia, and cross-currency basis are **not** separately modeled. A different formula supplied in class should supersede this illustrative convention.")
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_page(url: str) -> str:
     response = requests.get(url, timeout=18, headers={"User-Agent": "Mozilla/5.0 (education; financial-data exercise)"})
     response.raise_for_status()
     return response.text
+
+
+def damodaran_publication_date(url: str) -> str:
+    """Return only an explicitly labeled date on Damodaran's source page.
+
+    This is a dataset publication / analysis date, NOT a market quote time.
+    An absent/unparseable date is shown as unavailable rather than guessed.
+    """
+    try:
+        soup = BeautifulSoup(get_page(url), "html.parser")
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        month = (r"(?:January|February|March|April|May|June|July|August|"
+                 r"September|October|November|December)")
+        date = rf"{month}\s+(?:\d{{1,2}},?\s+)?20\d{{2}}"
+        patterns = [
+            rf"Last\s+updated\s*:\s*({date})",
+            rf"Date\s+of\s+Analysis\s*:\s*Data\s+used\s+is\s+as\s+of\s+({date})",
+            rf"Date\s+of\s+Analysis\s*:\s*({date})",
+        ]
+        for pattern in patterns:
+            found = re.search(pattern, text, flags=re.I)
+            if found:
+                return found.group(1)
+    except Exception:
+        pass
+    return "Not available"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def damodaran_dates() -> dict[str, str]:
+    return {
+        "betas": damodaran_publication_date(BETAS_HTML),
+        "tax": damodaran_publication_date(TAX_URL),
+        "spread": damodaran_publication_date(SPREAD_URL),
+    }
 
 
 def parse_rate(value) -> float:
@@ -265,10 +301,13 @@ st.sidebar.header("Parameters & overrides")
 refresh = st.sidebar.button("↻ Refresh external data", help="Clears cached Damodaran inputs and reloads the Trading Economics snapshot")
 if refresh:
     get_damodaran.clear()
+    damodaran_dates.clear()
+    get_page.clear()
     load_te_public_yield.clear()
     st.rerun()
 with st.spinner("Reading published data..."):
     sources, errors = get_damodaran()
+    published_dates = damodaran_dates()
 
 if errors:
     st.sidebar.warning("Some Damodaran inputs are unavailable; use the manual inputs below. " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
@@ -286,7 +325,7 @@ industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered b
 # Damodaran value. Manual editing is explicitly opt-in (or a data fallback).
 st.sidebar.markdown("### Unlevered beta")
 if industry_beta is not None:
-    st.sidebar.markdown(f"**{industry_beta:.3f}** · Damodaran industry beta")
+    st.sidebar.markdown(f"**{industry_beta:.3f}** · Damodaran · Date: {published_dates['betas']}")
     beta_override = st.sidebar.checkbox("Override unlevered beta", value=False, key="override_beta")
 else:
     st.sidebar.warning("Published unlevered beta unavailable; enter a value below.")
@@ -326,7 +365,7 @@ published_tax = published_target_tax if tax_jurisdiction == "Target country" els
 # Published Damodaran values are used automatically. Overrides only appear
 # when the user explicitly requests one, or when downloading fails.
 if published_tax is not None:
-    st.sidebar.markdown(f"**{published_tax:.2f}%** · {tax_country} (Damodaran)")
+    st.sidebar.markdown(f"**{published_tax:.2f}%** · {tax_country} (Damodaran) · Date: {published_dates['tax']}")
     tax_override = st.sidebar.checkbox("Override corporate tax rate", value=False, key="override_tax")
 else:
     st.sidebar.warning(f"No published tax rate available for {tax_country}; enter a value below.")
@@ -340,7 +379,7 @@ else:
 
 st.sidebar.markdown("### USD BBB spread")
 if published_spread is not None:
-    st.sidebar.markdown(f"**{published_spread:.3f}%** · Damodaran")
+    st.sidebar.markdown(f"**{published_spread:.3f}%** · Damodaran · Date: {published_dates['spread']}")
     spread_override = st.sidebar.checkbox("Override USD BBB spread", value=False, key="override_us_spread")
 else:
     st.sidebar.warning("Published BBB USD spread unavailable; enter a value below.")
@@ -433,7 +472,6 @@ st.caption("Published tax rates are shown for BOTH jurisdictions, but the same s
 audit_rows = [
     {"Input": "Currency", "United States (fixed)": "USD", f"Target: {country}": currency},
     {"Input": "10Y sovereign yield (%)", "United States (fixed)": f"{rf_us:.4f}%", f"Target: {country}": f"{rf_foreign:.4f}%"},
-    {"Input": "Yield observation date", "United States (fixed)": us_date or "unverified", f"Target: {country}": fc_date or "unverified"},
     {"Input": "Published corporate tax (%)", "United States (fixed)": f"{published_us_tax:.2f}%" if published_us_tax is not None else "unavailable", f"Target: {country}": f"{published_target_tax:.2f}%" if published_target_tax is not None else "unavailable"},
     {"Input": "Tax actually used in BOTH WACCs (%)", "United States (fixed)": f"{tax:.2f}% ({tax_country})", f"Target: {country}": f"{tax:.2f}% ({tax_country})"},
     {"Input": "Unlevered industry beta (U.S. industry dataset)", "United States (fixed)": f"{beta_u:.3f}", f"Target: {country}": f"{beta_u:.3f} (shared)"},
@@ -444,7 +482,7 @@ audit_rows = [
     {"Input": "Equity weight (%)", "United States (fixed)": f"{100-debt_pct:.0f}%", f"Target: {country}": f"{100-debt_pct:.0f}% (shared)"},
 ]
 st.dataframe(pd.DataFrame(audit_rows).set_index("Input"), width="stretch")
-st.caption("Damodaran source links and release context are listed at the bottom. Government yields are source-dated individually; 'unverified' is not a confirmed market observation date.")
+st.caption("Data values and their dates appear together in the sidebar. Detailed source links are listed below.")
 
 st.subheader("Side-by-side valuation inputs")
 left, right = st.columns(2)
@@ -479,6 +517,8 @@ else:
 selected_row = pd.DataFrame([{
     "industry": industry, "original_country": "United States", "country": country, "currency": currency,
     "us_published_tax_pct": published_us_tax, "target_published_tax_pct": published_target_tax,
+    "beta_data_date": published_dates["betas"], "tax_data_date": published_dates["tax"],
+    "us_bbb_data_date": published_dates["spread"],
     "project_tax_jurisdiction": tax_country,
     "unlevered_beta": beta_u, "levered_beta": values["beta_l"], "erp_pct": erp,
     "debt_weight": debt_weight, "tax_pct": tax, "us_10y_yield_pct": rf_us,
@@ -496,7 +536,14 @@ st.download_button("Download current project result (CSV)", selected_row.to_csv(
                    file_name="international_cost_of_capital_project.csv", mime="text/csv")
 
 st.subheader("Data sources and provenance")
-st.markdown(f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — published January 2026 (verify release on source)\n- [Damodaran corporate tax rates]({TAX_URL}) — country risk-premia table, January 2026\n- [Damodaran BBB borrowing spread]({SPREAD_URL}) — large non-financial company row, January 2026\n- [Trading Economics 10-year government yields](https://tradingeconomics.com/united-states/government-bond-yield) — source and date shown above for public HTML; manual input otherwise")
+st.markdown(
+    f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — dataset date: **{published_dates['betas']}**\n"
+    f"- [Damodaran corporate tax rates]({TAX_URL}) — dataset date: **{published_dates['tax']}**\n"
+    f"- [Damodaran BBB borrowing spread]({SPREAD_URL}) — dataset date: **{published_dates['spread']}**\n"
+    f"- [Trading Economics U.S. 10Y](https://tradingeconomics.com/united-states/government-bond-yield) — observation date: **{us_date or 'Not available'}**\n"
+    f"- [Trading Economics {country} 10Y](https://tradingeconomics.com/{slug}/government-bond-yield) — observation date: **{fc_date or 'Not available'}**"
+)
+st.caption("Damodaran dates are source-reported dataset/analysis dates; Trading Economics dates are quote observation dates when verifiable. Manual-entry dates are user supplied. Missing dates are not inferred from the app retrieval time.")
 st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
 if "betas" not in sources or tax_override or spread_override or us_manual or fc_manual:
     st.info("At least one figure is manually specified or an example fallback. Confirm source links and observation dates before submitting financial conclusions.")
