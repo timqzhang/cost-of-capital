@@ -352,7 +352,7 @@ if spread_override:
 else:
     spread_us = float(published_spread)
 
-# Yield inputs: concise sidebar display. Source details remain in the Input Audit.
+# Yield inputs: concise sidebar display; provenance is listed separately below.
 st.sidebar.markdown("### 10-year government yields")
 use_public = True  # Public-page retrieval is always attempted; no API key.
 
@@ -433,7 +433,6 @@ st.caption("Published tax rates are shown for BOTH jurisdictions, but the same s
 audit_rows = [
     {"Input": "Currency", "United States (fixed)": "USD", f"Target: {country}": currency},
     {"Input": "10Y sovereign yield (%)", "United States (fixed)": f"{rf_us:.4f}%", f"Target: {country}": f"{rf_foreign:.4f}%"},
-    {"Input": "Yield source", "United States (fixed)": "manual" if us_manual else (us_source or "unavailable"), f"Target: {country}": "manual" if fc_manual else (fc_source or "unavailable")},
     {"Input": "Yield observation date", "United States (fixed)": us_date or "unverified", f"Target: {country}": fc_date or "unverified"},
     {"Input": "Published corporate tax (%)", "United States (fixed)": f"{published_us_tax:.2f}%" if published_us_tax is not None else "unavailable", f"Target: {country}": f"{published_target_tax:.2f}%" if published_target_tax is not None else "unavailable"},
     {"Input": "Tax actually used in BOTH WACCs (%)", "United States (fixed)": f"{tax:.2f}% ({tax_country})", f"Target: {country}": f"{tax:.2f}% ({tax_country})"},
