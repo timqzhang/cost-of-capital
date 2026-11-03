@@ -19,16 +19,39 @@ BETAS_XLS = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 BETAS_HTML = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/Betas.html"
 TAX_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ctryprem.html"
 SPREAD_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
-COUNTRIES = {
-    "United States": ("USD", "united-states"),
-    "Australia": ("AUD", "australia"), "Brazil": ("BRL", "brazil"),
-    "Canada": ("CAD", "canada"), "China": ("CNY", "china"),
-    "France": ("EUR", "france"), "Germany": ("EUR", "germany"),
-    "India": ("INR", "india"), "Italy": ("EUR", "italy"),
-    "Japan": ("JPY", "japan"), "Mexico": ("MXN", "mexico"),
-    "South Korea": ("KRW", "south-korea"), "Switzerland": ("CHF", "switzerland"),
-    "United Kingdom": ("GBP", "united-kingdom"),
+TE_BONDS_URL = "https://tradingeconomics.com/bonds"
+# Country names verified on Trading Economics' public /bonds 10Y table.
+# Do not add countries based solely on a guessed per-country URL.
+COUNTRY_CURRENCIES = {
+    "Australia": "AUD", "Austria": "EUR", "Belgium": "EUR",
+    "Brazil": "BRL", "Canada": "CAD", "Chile": "CLP", "China": "CNY",
+    "Colombia": "COP", "Croatia": "EUR", "Czech Republic": "CZK",
+    "Denmark": "DKK", "Finland": "EUR", "France": "EUR",
+    "Germany": "EUR", "Greece": "EUR", "Hong Kong": "HKD",
+    "Hungary": "HUF", "Iceland": "ISK", "India": "INR",
+    "Indonesia": "IDR", "Ireland": "EUR", "Israel": "ILS",
+    "Italy": "EUR", "Japan": "JPY", "Kenya": "KES",
+    "Lithuania": "EUR", "Malaysia": "MYR", "Mexico": "MXN",
+    "Netherlands": "EUR", "New Zealand": "NZD", "Nigeria": "NGN",
+    "Norway": "NOK", "Pakistan": "PKR", "Peru": "PEN",
+    "Philippines": "PHP", "Poland": "PLN", "Portugal": "EUR",
+    "Romania": "RON", "Russia": "RUB", "Singapore": "SGD",
+    "Slovakia": "EUR", "Slovenia": "EUR", "South Africa": "ZAR",
+    "South Korea": "KRW", "Spain": "EUR", "Sweden": "SEK",
+    "Switzerland": "CHF", "Taiwan": "TWD", "Thailand": "THB",
+    "Turkey": "TRY", "United Kingdom": "GBP", "United States": "USD",
+    "Vietnam": "VND", "Zambia": "ZMW",
 }
+COUNTRY_ALIASES = {
+    "South Korea": ("Korea", "Korea (South)", "Republic of Korea"),
+    "Czech Republic": ("Czechia",),
+    "Russia": ("Russian Federation",),
+    "Turkey": ("Turkiye", "Türkiye"),
+    "Vietnam": ("Viet Nam",),
+    "Taiwan": ("Taiwan (Province of China)",),
+    "Hong Kong": ("Hong Kong SAR", "Hong Kong SAR, China"),
+}
+
 
 st.set_page_config(page_title="International Cost of Capital", page_icon="🌐", layout="wide")
 st.title("🌐 International Cost of Capital")
@@ -221,43 +244,69 @@ def load_bbb_spread() -> float:
     raise ValueError("BBB spread was not found in Damodaran's ratings table")
 
 
-def parse_te_public_page(html: str, country: str) -> tuple[float, str]:
-    """Extract an observed 10Y quote from a public country yield page.
+def parse_te_bonds_table(html: str) -> dict[str, tuple[float, str]]:
+    """Parse the public Trading Economics /bonds 10-year table.
 
-    Rejects pages whose header/quote cannot be verified. This is best-effort,
-    NOT an official API or guaranteed to work on Streamlit Cloud.
+    The page repeats countries in a Major10Y section and geographic sections.
+    Only consume rows inside tables with a Yield and Date header, never
+    random percentages or unrelated maturity rows elsewhere on the page.
+    Dates like 'Nov/02' are source labels WITHOUT an explicit year; preserve
+    them rather than inventing a year.
     """
     soup = BeautifulSoup(html, "html.parser")
-    # Strip scripts so embedded forecasts and JSON cannot masquerade as a quote.
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    heading = soup.find("h1")
-    heading_text = heading.get_text(" ", strip=True) if heading else ""
-    if "10" not in heading_text or not re.search(r"bond|treasury|yield", heading_text, re.I):
-        raise ValueError(f"10-year bond page heading not found for {country}")
-    text = soup.get_text(" ", strip=True)
-    # 'Actual' is the main current quote; take the FIRST one immediately after the heading.
-    start = text.find(heading_text)
-    relevant = text[start : start + 450] if start >= 0 else ""
-    m = re.search(r"\bActual\s+(-?\d{1,2}(?:\.\d{1,5})?)\b\s+Daily\s+Change\b", relevant, re.I)
-    if not m:
-        raise ValueError("10-year Actual yield quote not found in public HTML")
-    yield_pct = float(m.group(1))
-    if not -20 <= yield_pct <= 40:
-        raise ValueError("Public yield outside conservative validation range")
-    # This is an observation date only if stated explicitly on the page.
-    # Prefer the observation date tied to the 10Y yield quote, rather than a date
-    # from an unrelated news story. If unavailable, leave the date unverified.
-    stats = re.search(r"(?:10.year government bond yield|10Y bond yield)[^.]{0,150}?\bon\s+([A-Z][a-z]+\s+\d{1,2},?\s+20\d{2})", text, re.I)
-    updated = re.search(r"(?:data, forecasts, historical chart\s+-\s+was last updated on)\s+([A-Z][a-z]+\s+\d{1,2}(?:\s+of)?\s+20\d{2})", text, re.I)
-    observation = (stats.group(1) if stats else updated.group(1) if updated else "not verified on source page")
-    return yield_pct, observation
+    output: dict[str, tuple[float, str]] = {}
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)).casefold()
+                  for c in rows[0].find_all(["th", "td"], recursive=False)]
+        if not any("yield" == h for h in header) or not any("date" == h for h in header):
+            continue
+        yield_index = next(i for i, h in enumerate(header) if h == "yield")
+        date_index = next(i for i, h in enumerate(header) if h == "date")
+        # Some tables have an unnamed country column; use the first column.
+        for tr in rows[1:]:
+            cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)).strip()
+                     for c in tr.find_all(["th", "td"], recursive=False)]
+            if len(cells) <= max(yield_index, date_index) or not cells:
+                continue
+            name = cells[0]
+            if name not in COUNTRY_CURRENCIES:
+                continue  # Excludes Euro area and unsupported labels.
+            try:
+                yield_pct = float(cells[yield_index].replace(",", "").replace("%", ""))
+            except (TypeError, ValueError):
+                continue
+            if not (-20 <= yield_pct <= 100):
+                continue
+            date = cells[date_index] or "Not available"
+            # Retain source's yearless date; don't label it as a verified year.
+            if re.fullmatch(r"[A-Za-z]{3}/\d{1,2}", date):
+                date += " (year not shown)"
+            output.setdefault(name, (yield_pct, date))
+    if "United States" not in output or len(output) < 12:
+        raise ValueError(
+            f"Could not verify the Trading Economics 10Y table "
+            f"(recognized {len(output)} country quotes)."
+        )
+    return output
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_te_public_yield(slug: str, country: str) -> tuple[float, str]:
-    url = f"https://tradingeconomics.com/{slug}/government-bond-yield"
-    return parse_te_public_page(get_page(url), country)
+def load_te_bonds() -> dict[str, tuple[float, str]]:
+    return parse_te_bonds_table(get_page(TE_BONDS_URL))
+
+
+def tax_lookup(table: dict[str, float], country: str) -> float | None:
+    """Match published tax-country names without relying on exact spelling."""
+    def norm(value):
+        return re.sub(r"[^a-z0-9]", "", value.casefold())
+    by_normalized = {norm(k): v for k, v in table.items()}
+    for candidate in (country, *COUNTRY_ALIASES.get(country, ())):
+        if norm(candidate) in by_normalized:
+            return by_normalized[norm(candidate)]
+    return None
 
 
 def calculate(beta_u: float, debt_weight: float, tax: float, erp: float,
@@ -303,11 +352,17 @@ if refresh:
     get_damodaran.clear()
     damodaran_dates.clear()
     get_page.clear()
-    load_te_public_yield.clear()
+    load_te_bonds.clear()
     st.rerun()
 with st.spinner("Reading published data..."):
     sources, errors = get_damodaran()
     published_dates = damodaran_dates()
+    try:
+        te_quotes = load_te_bonds()
+        te_error = None
+    except Exception as exc:
+        te_quotes = {}
+        te_error = str(exc)
 
 if errors:
     st.sidebar.warning("Some Damodaran inputs are unavailable; use the manual inputs below. " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
@@ -317,8 +372,22 @@ industries = all_betas["Industry"].tolist() if len(all_betas) else ["Software (S
 preferred = "Software (System & Application)"
 st.sidebar.markdown("### Project selection")
 industry = st.sidebar.selectbox("U.S. industry", industries, index=industries.index(preferred) if preferred in industries else 0)
-country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)", list(COUNTRIES), index=0)
-currency, slug = COUNTRIES[country]
+tax_table = sources.get("tax", {})
+# On success use ONLY countries actually found in the 10Y table. When the
+# external service is temporarily unavailable, use names previously verified
+# on /bonds (never inferred URLs), with manually entered yields.
+te_available = list(te_quotes) if te_quotes else list(COUNTRY_CURRENCIES)
+country_options = sorted(c for c in te_available
+                         if c != "United States" and
+                         (tax_lookup(tax_table, c) is not None or not tax_table))
+if not country_options:
+    st.error("No countries can be matched between the tax and 10Y datasets. Refresh the data.")
+    st.stop()
+country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)",
+                               country_options, index=country_options.index("Japan") if "Japan" in country_options else 0)
+currency = COUNTRY_CURRENCIES[country]
+if te_error:
+    st.sidebar.warning("Trading Economics /bonds could not be read; yields must be entered manually. Details below.")
 
 industry_beta = float(all_betas.set_index("Industry").loc[industry, "Unlevered beta"]) if len(all_betas) and industry in all_betas["Industry"].values else None
 # Like published tax and BBB spread, the industry beta defaults to the
@@ -348,8 +417,8 @@ st.sidebar.caption(f"Debt: {debt_pct}% · Equity: {100-debt_pct}% · D/E: {debt_
 # Load both tax rates from the same country table. The United States is a
 # fixed baseline, not a selectable target-market replacement.
 tax_table = sources.get("tax", {})
-published_us_tax = tax_table.get("United States")
-published_target_tax = tax_table.get("Korea" if country == "South Korea" else country)
+published_us_tax = tax_lookup(tax_table, "United States")
+published_target_tax = tax_lookup(tax_table, country)
 published_spread = sources.get("spread")
 
 st.sidebar.markdown("### Project tax rate")
@@ -393,20 +462,16 @@ else:
 
 # Yield inputs: concise sidebar display; provenance is listed separately below.
 st.sidebar.markdown("### 10-year government yields")
-use_public = True  # Public-page retrieval is always attempted; no API key.
+# One verified table feeds BOTH countries; no per-country URL guessing.
+def resolve_yield(country_name: str):
+    record = te_quotes.get(country_name)
+    if record is None:
+        return None, None, None, te_error or f"No {country_name} quote on the 10Y table"
+    value, date = record
+    return value, date, "Trading Economics /bonds", None
 
-def resolve_yield(country_name: str, country_slug: str):
-    try:
-        val, date = load_te_public_yield(country_slug, country_name)
-        return val, date, "Trading Economics public page", None
-    except Exception as exc:
-        return None, None, None, str(exc)
-
-us_value, us_source_date, us_source, us_error = resolve_yield("United States", "united-states")
-if country == "United States":
-    fc_value, fc_source_date, fc_source, fc_error = us_value, us_source_date, us_source, us_error
-else:
-    fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country, slug)
+us_value, us_source_date, us_source, us_error = resolve_yield("United States")
+fc_value, fc_source_date, fc_source, fc_error = resolve_yield(country)
 
 # Show the retrieved value and its observation date before optional editing.
 def yield_control(label: str, quote: float | None, source_date: str | None,
@@ -540,8 +605,7 @@ st.markdown(
     f"- [Damodaran U.S. industry betas]({sources.get('betas', (None, BETAS_XLS))[1] if 'betas' in sources else BETAS_XLS}) — dataset date: **{published_dates['betas']}**\n"
     f"- [Damodaran corporate tax rates]({TAX_URL}) — dataset date: **{published_dates['tax']}**\n"
     f"- [Damodaran BBB borrowing spread]({SPREAD_URL}) — dataset date: **{published_dates['spread']}**\n"
-    f"- [Trading Economics U.S. 10Y](https://tradingeconomics.com/united-states/government-bond-yield) — observation date: **{us_date or 'Not available'}**\n"
-    f"- [Trading Economics {country} 10Y](https://tradingeconomics.com/{slug}/government-bond-yield) — observation date: **{fc_date or 'Not available'}**"
+    f"- [Trading Economics 10Y bond yield table]({TE_BONDS_URL}) — U.S. date: **{us_date or 'Not available'}**; {country} date: **{fc_date or 'Not available'}**"
 )
 st.caption("Damodaran dates are source-reported dataset/analysis dates; Trading Economics dates are quote observation dates when verifiable. Manual-entry dates are user supplied. Missing dates are not inferred from the app retrieval time.")
 st.caption(f"App checked at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} • This is not a live quote timestamp.")
