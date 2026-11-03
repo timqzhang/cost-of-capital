@@ -422,7 +422,7 @@ if not country_options:
     st.error("No countries can be matched between the tax and 10Y datasets. Refresh the data.")
     st.stop()
 country = st.sidebar.selectbox("Target country (U.S. is fixed baseline)",
-                               country_options, index=country_options.index("Japan") if "Japan" in country_options else 0)
+                               country_options, index=country_options.index("United States") if "United States" in country_options else 0)
 currency = COUNTRY_CURRENCIES[country]
 if te_error:
     st.sidebar.warning("Trading Economics 10Y table unavailable from this server. Enter yields manually; see retrieval details below.")
@@ -484,7 +484,8 @@ if tax_override:
 else:
     tax = float(published_tax)
 
-st.sidebar.markdown("### USD BBB spread")
+st.sidebar.markdown("### BBB borrowing spreads")
+st.sidebar.markdown("**USD BBB spread**")
 if published_spread is not None:
     st.sidebar.markdown(f"**{published_spread:.3f}%** · Damodaran · Date: {published_dates['spread']}")
     spread_override = st.sidebar.checkbox("Override USD BBB spread", value=False, key="override_us_spread")
@@ -497,6 +498,11 @@ if spread_override:
                                         step=0.05, key="manual_us_spread")
 else:
     spread_us = float(published_spread)
+
+# Reserve the next sidebar position for the converted BBB spread. Its value
+# depends on both government yields, which are collected further below.
+# A Streamlit container lets us render the calculation here once inputs exist.
+foreign_bbb_section = st.sidebar.container()
 
 # Yield inputs: concise sidebar display; provenance is listed separately below.
 st.sidebar.markdown("### 10-year government yields")
@@ -554,18 +560,20 @@ if country == "United States" and abs(rf_us - rf_foreign) > 1e-8:
 
 debt_weight = debt_pct / 100
 base = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us)
-st.sidebar.markdown("### Target-currency BBB spread")
-st.sidebar.caption(f"Automatic BBB {currency} spread: **{base['spread_fc_auto']:.3f}%**")
-spread_override_on = st.sidebar.checkbox("Override converted foreign-currency spread", value=False)
-if spread_override_on:
-    spread_fc_override = st.sidebar.number_input(
-        f"Manual BBB spread in {currency} (%)", min_value=0.0, max_value=30.0,
-        value=float(base["spread_fc_auto"]), step=0.05)
-else:
-    spread_fc_override = None
+with foreign_bbb_section:
+    st.markdown("**Target-currency BBB spread**")
+    st.caption(f"Automatic BBB {currency} spread: **{base['spread_fc_auto']:.3f}%**")
+    spread_override_on = st.checkbox("Override converted foreign-currency spread", value=False)
+    if spread_override_on:
+        spread_fc_override = st.number_input(
+            f"Manual BBB spread in {currency} (%)", min_value=0.0, max_value=30.0,
+            value=float(base["spread_fc_auto"]), step=0.05)
+    else:
+        spread_fc_override = None
 values = calculate(beta_u, debt_weight, tax, erp, rf_us, rf_foreign, spread_us,
                    spread_fc_override)
-st.sidebar.caption(f"Used: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic conversion'})")
+with foreign_bbb_section:
+    st.caption(f"Used: **{values['spread_fc']:.3f}%** ({'manual override' if spread_override_on else 'automatic conversion'})")
 
 # Present the published inputs for BOTH countries in one aligned table.
 # The tax observations are reference data; the model uses ONE project tax rate
